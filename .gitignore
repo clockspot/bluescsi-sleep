@@ -1,0 +1,8 @@
+.DS_Store
+.vscode
+.claude/
+
+build/
+
+# MacsBug crash dumps (development scratch)
+MacsBug/
