@@ -7,8 +7,7 @@
  *
  * Design
  * ──────
- * After boot the INIT code resource is locked in memory permanently.
- * Two OS hooks are installed:
+ * Two OS hooks are installed in _start():
  *
  *   Sleep Queue  – catches sleepWakeUp at interrupt level.  Calls
  *                  NMInstall to post a silent Notification Manager
@@ -18,14 +17,29 @@
  *                  task level (safe for all Toolbox calls).  Performs
  *                  KillIO + PBControlSync, then calls NMRemove.
  *
- * This replaces the earlier WNE-patch approach, which was unreliable:
- * any extension loaded after ours could re-patch _WaitNextEvent, and
- * if that extension's handler lived in a relocatable System heap block
- * the address stored in the trap table became stale after heap
- * compaction, crashing the machine on the first sleep attempt.
+ * Code lifetime: copy-and-relocate
+ * ────────────────────────────────
+ * On System 7.5.5 with Retro68's --mac-flat INIT layout, the 'INIT'
+ * code resource does NOT survive past _start() returning — even with
+ * Get1Resource + DetachResource + HLock + HNoPurge, the block is
+ * reclaimed during boot and the memory is reused (in our testing, by a
+ * 'sfnt' font resource).  The OS then dispatches sleep/wake callbacks
+ * into garbage and crashes.
  *
- * The Notification Manager avoids all of this: there are no stored
- * trap addresses and no WNE chain to corrupt.
+ * To work around this, _start() copies the text+data of the resource
+ * into a System-heap allocation and walks the absolute relocation
+ * records to fix kind-0/code and kind-1/data references inside the
+ * copy.  The Sleep Queue and Notification Manager hooks are then
+ * installed with the COPIED addresses — so the OS dispatches into the
+ * System-heap block, which is independent of the resource map and
+ * lives for the duration of the session.
+ *
+ * Internal calls inside the relocated copy work because:
+ *   • Absolute long JSRs (kind-0) point into the copy after fixup.
+ *   • PC-relative branches survive a verbatim copy unchanged (both
+ *     source and target moved by the same delta).
+ *   • OS trap calls (A-traps) dispatch through the trap table and
+ *     don't depend on our code's location.
  *
  * A5-free design
  * ──────────────
@@ -35,8 +49,6 @@
  *   • SleepQRec is the first field of ExtState, so the sleep callback
  *     receives qRecPtr == &state — no A5 needed.
  *   • nmRec.nmRefCon holds the ExtState pointer for the nmResp callback.
- *   • ReinitViaNotification lives in the locked INIT code resource and
- *     has a stable address for the life of the session.
  *
  * Logging
  * ───────
@@ -58,8 +70,13 @@
 #include <Memory.h>
 #include <Notification.h>
 #include <OSUtils.h>
+#include <Resources.h>
 #include <string.h>
 #include "Retro68Runtime.h"
+
+/* Linker symbols delimit the relocatable image (text + data).
+ * Relocation records sit immediately after _edata in the resource. */
+extern unsigned char _stext, _edata;
 
 /* ── low-memory Unit Table ───────────────────────────────────────────────── */
 
@@ -157,6 +174,27 @@ static void LogStr(short ref, const char *s)
     const char *p = s;
     while (*p++) n++;
     if (n > 0) FSWrite(ref, &n, (Ptr)s);
+}
+
+/* Write a single byte as two uppercase hex chars. */
+static void LogHex8(short ref, unsigned char v)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    char  buf[2];
+    long  n = 2;
+    buf[0] = hex[(v >> 4) & 0xF];
+    buf[1] = hex[v & 0xF];
+    FSWrite(ref, &n, buf);
+}
+
+/* Write a sequence of bytes as colon-separated hex (e.g. "00:80:48:11:22:33"). */
+static void LogHexBytes(short ref, const unsigned char *p, short len)
+{
+    short i;
+    for (i = 0; i < len; i++) {
+        if (i > 0) { long n = 1; FSWrite(ref, &n, (Ptr)":"); }
+        LogHex8(ref, p[i]);
+    }
 }
 
 /* Write a signed 16-bit decimal integer. */
@@ -266,6 +304,47 @@ static void FindAndLogDriver(ExtState *state, short logRef)
     state->driverRefNum = ref;
 }
 
+/* ── driver status probe ─────────────────────────────────────────────────── */
+
+/*
+ * Issue PBStatusSync with csCode = 1.  On Apple-protocol .ENET drivers
+ * this is "get hardware address" and returns the 6-byte MAC in csParam.
+ * For other drivers it may return something else — we log the raw bytes
+ * either way so the response is interpretable from the log.
+ *
+ * outBytes must point to a 16-byte buffer.  Returns the OSErr from
+ * PBStatusSync (noErr on success).
+ */
+static OSErr ProbeDriverStatus(short ref, unsigned char outBytes[16])
+{
+    CntrlParam cpb;
+    OSErr      err;
+
+    memset(&cpb, 0, sizeof(cpb));
+    cpb.ioCRefNum = ref;
+    cpb.csCode    = 1;
+    err = PBStatusSync((ParmBlkPtr)&cpb);
+    memcpy(outBytes, (const void *)&cpb.csParam[0], 16);
+    return err;
+}
+
+/*
+ * Helper: probe driver, log a labelled line of err + raw bytes.
+ * Safe to call only with a valid log ref and non-zero driver ref.
+ */
+static void LogDriverProbe(short logRef, short ref, const char *label)
+{
+    unsigned char buf[16];
+    OSErr         err = ProbeDriverStatus(ref, buf);
+
+    LogStr(logRef, label);
+    LogStr(logRef, " err=");
+    LogShort(logRef, err);
+    LogStr(logRef, " bytes=");
+    LogHexBytes(logRef, buf, 16);
+    LogStr(logRef, "\r");
+}
+
 /* ── task-level reinit (Notification Manager nmResp, no A5) ─────────────── */
 
 /*
@@ -309,6 +388,11 @@ static pascal void ReinitViaNotification(NMRecPtr nmReqPtr)
     }
 
     if (ref != 0) {
+        /* Probe the driver before doing anything — captures whether the
+         * driver is responsive in its post-wake state.  Compare against
+         * the pre-sleep probe (logged on sleepDemand). */
+        if (logRef) LogDriverProbe(logRef, ref, "Pre-reset");
+
         killErr = KillIO(ref);
 
         memset(&cpb, 0, sizeof(cpb));
@@ -331,6 +415,10 @@ static pascal void ReinitViaNotification(NMRecPtr nmReqPtr)
             LogStr(logRef, " ctrl1=");
             LogShort(logRef, ctrl1Err);
             LogStr(logRef, "\r");
+
+            /* Probe again to see whether the reset altered the driver's
+             * observable state. */
+            LogDriverProbe(logRef, ref, "Post-reset");
         }
     } else {
         if (logRef) LogStr(logRef, "No driver found, skipping reinit\r");
@@ -347,6 +435,26 @@ long SleepQCallbackImpl(long message, SleepQRecPtr qRecPtr)
 {
     /* SleepQRec is the first field of ExtState, so qRecPtr == &state */
     ExtState *state = (ExtState *)qRecPtr;
+
+    /* sleepDemand fires at task level just before the machine actually
+     * sleeps.  Probe the driver here to capture a known-good baseline. */
+    if (message == sleepDemand) {
+        short logRef = LogOpen(state);
+        short ref    = state->driverRefNum;
+
+        if (ref == 0) FindAndLogDriver(state, logRef);
+        ref = state->driverRefNum;
+
+        if (logRef) {
+            LogStr(logRef, "=== Sleep (about to wake ");
+            LogShort(logRef, (short)(state->wakeCount + 1));
+            LogStr(logRef, ") ===\r");
+            if (ref != 0) LogDriverProbe(logRef, ref, "Pre-sleep");
+            else          LogStr(logRef, "No driver found at sleep time\r");
+            LogClose(logRef, state->logSpec.vRefNum);
+        }
+    }
+
     if (message == sleepWakeUp && !state->nmPending) {
         state->nmPending = 1;
         NMInstall(&state->nmRec);   /* NMInstall is documented interrupt-safe */
@@ -366,23 +474,79 @@ asm(
 );
 extern long SleepQGlue(void);
 
+/* ── relocate-the-copy helper ────────────────────────────────────────────── */
+
+/*
+ * Walk Retro68's first (absolute) relocation pass on a freshly copied
+ * text+data block, adding `delta` to each kind-0/code and kind-1/data
+ * longword so internal absolute references point into the copy.
+ *
+ * Format (see libretro/relocate.c): a uleb128 stream terminated by a 0
+ * byte; each record encodes (offset_increment << 2) | kind.  kind 0=code,
+ * 1=data, 2=bss, 3=jump-table.
+ *
+ * BSS (kind 2) is shared with the original allocation, so we leave those
+ * longwords alone.  Jump-table (kind 3) does not apply to flat-mac code
+ * resources.  We skip the relative-relocation pass entirely: PC-relative
+ * offsets within the block are preserved by a verbatim copy.
+ */
+static void RelocateCopyAbs(unsigned char *newCode, unsigned char *reloc,
+                            long delta)
+{
+    unsigned char *addrPtr = newCode - 1;
+    while (*reloc) {
+        unsigned long val = 0;
+        int           shift = 0;
+        unsigned char b;
+        unsigned long kind;
+        do {
+            b = *reloc++;
+            val |= (unsigned long)(b & 0x7F) << shift;
+            shift += 7;
+        } while (b & 0x80);
+        addrPtr += val >> 2;
+        kind = val & 0x3;
+        if (kind == 0 || kind == 1) {
+            unsigned long a;
+            a  = ((unsigned long)addrPtr[0]) << 24;
+            a |= ((unsigned long)addrPtr[1]) << 16;
+            a |= ((unsigned long)addrPtr[2]) << 8;
+            a |=  (unsigned long)addrPtr[3];
+            a += (unsigned long)delta;
+            addrPtr[0] = (unsigned char)(a >> 24);
+            addrPtr[1] = (unsigned char)(a >> 16);
+            addrPtr[2] = (unsigned char)(a >> 8);
+            addrPtr[3] = (unsigned char) a;
+        }
+    }
+}
+
 /* ── INIT entry point ────────────────────────────────────────────────────── */
 
 void _start(void)
 {
-    ExtState *state;
+    ExtState      *state;
+    unsigned char *origBase, *newCode;
+    long           textDataSize, delta;
+    void          *copiedGlue, *copiedNmResp;
 
     RETRO68_RELOCATE();
     Retro68CallConstructors();
 
-    /* Allocate all mutable state in System heap — survives after _start() returns.
-     *
-     * IMPORTANT: _start() intentionally does no file I/O.  Opening a file at
-     * boot time allocates File Control Blocks as relocatable System heap blocks.
-     * That allocation can trigger heap compaction, which moves other extensions'
-     * trap handlers to new addresses while the trap table still holds the old
-     * ones — leaving stale pointers that crash on the next trap dispatch.
-     * All logging is deferred to task level (first wake via ReinitViaNotification). */
+    /* Copy text+data into a System-heap block and fix up absolute
+     * relocations so callbacks dispatched after _start() exits land in
+     * the copy — the original 'INIT' resource doesn't survive boot. */
+    origBase     = &_stext;
+    textDataSize = (long)(&_edata - &_stext);
+    newCode = (unsigned char *)NewPtrSysClear(textDataSize);
+    if (newCode == NULL) goto done;
+    BlockMoveData((Ptr)origBase, (Ptr)newCode, textDataSize);
+    delta = (long)newCode - (long)origBase;
+    RelocateCopyAbs(newCode, &_edata, delta);
+
+    copiedGlue   = (void *)((char *)&SleepQGlue            + delta);
+    copiedNmResp = (void *)((char *)&ReinitViaNotification + delta);
+
     state = (ExtState *)NewPtrSysClear(sizeof(ExtState));
     if (state == NULL) goto done;
 
@@ -394,12 +558,12 @@ void _start(void)
     state->nmRec.nmIcon   = NULL;
     state->nmRec.nmSound  = NULL;
     state->nmRec.nmStr    = NULL;
-    state->nmRec.nmResp   = (NMUPP)ReinitViaNotification;
+    state->nmRec.nmResp   = (NMUPP)copiedNmResp;
     state->nmRec.nmRefCon = (long)state;
 
     /* Install Sleep Queue entry */
     state->sleepRec.sleepQType = sleepQType;            /* must be 16 */
-    state->sleepRec.sleepQProc = (SleepQUPP)SleepQGlue;
+    state->sleepRec.sleepQProc = (SleepQUPP)copiedGlue;
     SleepQInstall(&state->sleepRec);
 
 done:
