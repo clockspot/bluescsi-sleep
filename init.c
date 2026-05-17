@@ -8,27 +8,44 @@
  * hang at OTOpenInternetServices with kEHOSTUNREACHErr (-3259) for
  * ~90 seconds before timing out.
  *
+ * Build variants
+ * ──────────────
+ *   • Production (default): silent on success.  Errors are reported
+ *     to the user via a Notification Manager modal alert (Apple
+ *     menu blinks; alert appears next time user yields to the OS).
+ *
+ *   • Diagnostic (compile with -DBLUESCSI_SLEEP_DIAGNOSTIC=1):
+ *     same alert behaviour PLUS a verbose log to "BlueSCSI Sleep
+ *     Log" in the System Folder — every wake, the bus walk on
+ *     first wake, and the SCSI 0x0E result on each wake.
+ *
  * Architecture
  * ────────────
- *   • _start() installs a Sleep Queue entry whose callback (interrupt
- *     level) posts a Notification Manager request on sleepWakeUp.
+ *   • _start() installs a Sleep Queue entry whose callback
+ *     (interrupt level) posts a Notification Manager request on
+ *     sleepWakeUp.
  *   • The NM callback (task level) issues SCSI 0x0E enable via the
  *     synchronous SCSI Manager directly, bypassing the .ENET driver
  *     and OT entirely.
  *   • SCSI ID is auto-discovered on first wake by walking IDs 0–6
  *     with INQUIRY (0x12), matching "Dayna" or "SCSI/Link" in the
  *     vendor or product field.  Cached for subsequent wakes.
+ *   • On error, a second NM record is installed with nmStr set to
+ *     a constructed Pascal-string message — the OS displays it as a
+ *     modal alert.  errPending guards against duplicate queueing.
+ *     Discovery failures are sticky (one alert per session) so an
+ *     unconfigured install does not spam the user every wake.
  *
  * Code lifetime: copy-and-relocate
  * ────────────────────────────────
  * Under Retro68's --mac-flat INIT layout, the 'INIT' code resource
  * does not survive _start() returning even with DetachResource +
- * HLock + HNoPurge — the OS reuses the memory after boot, leaving
- * Sleep Queue callbacks pointing at garbage.  _start() therefore
- * copies text+data to a System-heap allocation, walks Retro68's
- * absolute relocation records to fix kind-0/code and kind-1/data
- * references inside the copy, and installs the callbacks with the
- * copied addresses.
+ * HLock + HNoPurge — the OS reuses the memory after boot.  _start()
+ * therefore copies text+data to a System-heap allocation, walks
+ * Retro68's absolute relocation records to fix kind-0/code and
+ * kind-1/data references inside the copy, and installs callbacks
+ * with the copied addresses.  See RelocateCopyAbs below for the
+ * format details.
  *
  * A5-free design
  * ──────────────
@@ -37,19 +54,11 @@
  *   • An ExtState block in the System heap (NewPtrSysClear).
  *   • SleepQRec is the first field, so the sleep callback receives
  *     qRecPtr == &state — no A5 needed.
- *   • nmRec.nmRefCon holds the ExtState pointer for the nmResp
- *     callback.
+ *   • Both NMRecs' nmRefCon holds the ExtState pointer.
  *
- * Logging
- * ───────
- * "BlueSCSI Sleep Log" in the System Folder is appended on first
- * wake (one-time bus walk + selected ID) and on error (SCSI failure
- * or BlueSCSI not detected).  Silent on successful subsequent wakes,
- * so the log doesn't grow over hundreds of sleep/wake cycles.
- *
- * All log I/O uses File Manager traps directly (FSpOpenDF, FSWrite,
- * etc.) rather than stdio, because stdio depends on A5-relative
- * globals that are not available after _start() returns.
+ * All log I/O (diagnostic build only) uses File Manager traps
+ * directly (FSpOpenDF, FSWrite, etc.) rather than stdio, because
+ * stdio depends on A5-relative globals.
  */
 
 #include <MacTypes.h>
@@ -61,6 +70,10 @@
 #include <SCSI.h>
 #include <string.h>
 #include "Retro68Runtime.h"
+
+#ifndef BLUESCSI_SLEEP_DIAGNOSTIC
+#define BLUESCSI_SLEEP_DIAGNOSTIC 0
+#endif
 
 /* Linker symbols delimit the relocatable image (text + data).
  * Relocation records sit immediately after _edata in the resource. */
@@ -76,16 +89,120 @@ extern unsigned char _stext, _edata;
  */
 typedef struct ExtState {
     SleepQRec       sleepRec;
-    unsigned char   nmPending;      /* 1 = NMRec is already in the NM queue */
-    Boolean         logSpecValid;
+    unsigned char   nmPending;        /* 1 = wake NMRec queued */
+    unsigned char   errPending;       /* 1 = error alert NMRec queued */
+    Boolean         discoveryAlertShown; /* sticky: don't spam on every wake */
+    unsigned char   _pad;
     short           wakeCount;
-    short           scsiID;         /* BlueSCSI SCSI ID; -1 = not yet discovered */
-    short           _pad;
+    short           scsiID;           /* -1 = not yet discovered */
+    void           *copiedErrorAlertResp;  /* relocated, set by _start */
+    NMRec           nmRec;            /* wake reinit */
+    NMRec           errNmRec;         /* error alert */
+    Str255          errString;        /* Pascal string for nmStr */
+#if BLUESCSI_SLEEP_DIAGNOSTIC
+    Boolean         logSpecValid;
+    unsigned char   _pad2;
     FSSpec          logSpec;
-    NMRec           nmRec;
+#endif
 } ExtState;
 
-/* ── A5-free logging helpers (used for discovery + errors only) ──────────── */
+/* ── Pascal-string helpers (for alert messages) ─────────────────────────── */
+
+static void PStrSet(Str255 dst, const char *src)
+{
+    unsigned char n = 0;
+    while (src[n] && n < 255) {
+        dst[n + 1] = (unsigned char)src[n];
+        n++;
+    }
+    dst[0] = n;
+}
+
+static void PStrAppendC(Str255 dst, const char *src)
+{
+    unsigned char len = dst[0];
+    while (*src && len < 255) {
+        dst[len + 1] = (unsigned char)*src++;
+        len++;
+    }
+    dst[0] = len;
+}
+
+static void PStrAppendShort(Str255 dst, short val)
+{
+    char           buf[7];
+    short          i = 7;
+    Boolean        neg = (val < 0);
+    unsigned short u;
+    unsigned char  len;
+
+    u = neg ? (unsigned short)(0u - (unsigned short)val) : (unsigned short)val;
+    if (u == 0) buf[--i] = '0';
+    else        while (u) { buf[--i] = (char)('0' + u % 10); u /= 10; }
+    if (neg) buf[--i] = '-';
+
+    len = dst[0];
+    while (i < 7 && len < 255) {
+        dst[len + 1] = (unsigned char)buf[i++];
+        len++;
+    }
+    dst[0] = len;
+}
+
+/* ── Notification Manager error alert ────────────────────────────────────── */
+
+/*
+ * NM response for the error alert.  Fires at task level after the
+ * user dismisses the alert dialog.  Clears errPending so subsequent
+ * errors can re-alert.
+ */
+static pascal void ErrorAlertResp(NMRecPtr nmReqPtr)
+{
+    ExtState *state = (ExtState *)nmReqPtr->nmRefCon;
+    state->errPending = 0;
+    NMRemove(nmReqPtr);
+}
+
+/*
+ * Build a Pascal string from the given prefix, optional err code,
+ * optional stat byte, optional suffix; queue an NM alert.  If an
+ * error alert is already queued, this call is silently ignored
+ * (we don't stack multiple alerts).
+ *
+ * `appendErr` true ⇒ append " (err=%d stat=%d)" using err and stat.
+ */
+static void PostErrorAlert(ExtState *state,
+                           const char *prefix,
+                           Boolean appendErr, OSErr err, short stat,
+                           const char *suffix)
+{
+    if (state->errPending) return;
+
+    PStrSet(state->errString, prefix);
+    if (appendErr) {
+        PStrAppendC(state->errString, " (err=");
+        PStrAppendShort(state->errString, (short)err);
+        PStrAppendC(state->errString, " stat=");
+        PStrAppendShort(state->errString, stat);
+        PStrAppendC(state->errString, ")");
+    }
+    if (suffix) PStrAppendC(state->errString, suffix);
+
+    state->errNmRec.qType    = nmType;
+    state->errNmRec.nmMark   = 0;
+    state->errNmRec.nmIcon   = NULL;
+    state->errNmRec.nmSound  = NULL;
+    state->errNmRec.nmStr    = state->errString;
+    state->errNmRec.nmResp   = (NMUPP)state->copiedErrorAlertResp;
+    state->errNmRec.nmRefCon = (long)state;
+
+    state->errPending = 1;
+    NMInstall(&state->errNmRec);
+}
+
+/* ── A5-free logging helpers (diagnostic build only) ────────────────────── */
+
+#if BLUESCSI_SLEEP_DIAGNOSTIC
 
 static short LogOpen(ExtState *state)
 {
@@ -135,7 +252,7 @@ static void LogStr(short ref, const char *s)
 
 static void LogShort(short ref, short val)
 {
-    char           buf[7];   /* worst case: "-32768" = 6 chars */
+    char           buf[7];
     short          i = 7;
     Boolean        neg = (val < 0);
     unsigned short u;
@@ -150,15 +267,13 @@ static void LogShort(short ref, short val)
     FSWrite(ref, &n, buf + i);
 }
 
+#endif /* BLUESCSI_SLEEP_DIAGNOSTIC */
+
 /* ── SCSI Manager helpers (old/sync API; inline _SCSIDispatch traps) ────── */
 
 /*
- * Issue a SCSI command with no data transfer.  Returns the SCSI Manager
- * error from the worst-failing call in the GET/SELECT/CMD/COMPLETE
- * sequence; *outStat receives the device-side status byte (0 = GOOD).
- *
- * Task level only.  SCSIGet serialises with any in-flight .ENET driver
- * I/O, so no explicit KillIO is needed.
+ * Issue a SCSI command with no data transfer.  Task level only.
+ * SCSIGet serialises with any in-flight .ENET driver I/O.
  */
 static OSErr ScsiCmdNoData(short id, const unsigned char *cdb, short cdbLen,
                            short *outStat)
@@ -174,7 +289,6 @@ static OSErr ScsiCmdNoData(short id, const unsigned char *cdb, short cdbLen,
     err = SCSISelect(id);
     if (err == noErr) err = SCSICmd((Ptr)cdb, cdbLen);
 
-    /* SCSIComplete must be called to release the bus, even after error. */
     {
         OSErr compErr = SCSIComplete(&stat, &msg, 60 /* ticks ≈ 1 s */);
         *outStat = stat;
@@ -185,7 +299,7 @@ static OSErr ScsiCmdNoData(short id, const unsigned char *cdb, short cdbLen,
 
 /*
  * Issue SCSI INQUIRY (0x12) and read the first 36 bytes into outBuf.
- * Uses a 2-instruction TIB: scInc to transfer 36 bytes, then scStop.
+ * 2-instruction TIB: scInc to transfer 36 bytes, then scStop.
  */
 static OSErr ScsiInquiry(short id, unsigned char outBuf[36], short *outStat)
 {
@@ -222,7 +336,7 @@ static OSErr ScsiInquiry(short id, unsigned char outBuf[36], short *outStat)
 }
 
 /*
- * Issue Dayna SCSI/Link 0x0E "toggle interface".  BlueSCSI's firmware
+ * Issue Dayna SCSI/Link 0x0E "toggle interface".  BlueSCSI firmware
  * (lib/SCSI2SD/src/firmware/network.c) checks cdb[5] & 0x80:
  *
  *   cdb[5] = 0x80  → scsiNetworkEnabled = true; inbound queue cleared
@@ -266,18 +380,23 @@ static Boolean InqContains(const unsigned char *field, short fieldLen,
 
 /*
  * Walk SCSI IDs 0–6 looking for the BlueSCSI DaynaPORT emulation.
- * Returns the first matching ID, or -1 if none found.  If logRef is
- * non-zero, logs every inquiry response (so the user can see what's
- * on the bus); pass 0 for silent operation.
+ * Returns the first matching ID, or -1 if none found.  In diagnostic
+ * builds, logs each inquiry response when logRef is non-zero.
  *
  * Heuristic: match "DAYNA" or "SCSI/LINK" in vendor or product.
  * Real BlueSCSI hardware reports vendor="Dayna" product="SCSI/Link"
- * with peripheral type 0x03 (processor device).  HDD emulations on
- * the same bus legitimately put "BlueSCSI" in their product field —
- * we deliberately don't match on that string, lest we toggle the
- * wrong target.
+ * with peripheral type 0x03 (processor device).  HDD emulations
+ * legitimately put "BlueSCSI" in their product field — we
+ * deliberately don't match on that string, lest we toggle the wrong
+ * target.
  */
-static short DiscoverBlueScsiID(short logRef)
+static short DiscoverBlueScsiID(
+#if BLUESCSI_SLEEP_DIAGNOSTIC
+    short logRef
+#else
+    void
+#endif
+)
 {
     short         id, found = -1;
     unsigned char inq[36];
@@ -287,11 +406,13 @@ static short DiscoverBlueScsiID(short logRef)
     for (id = 0; id <= 6; id++) {
         err = ScsiInquiry(id, inq, &stat);
 
+#if BLUESCSI_SLEEP_DIAGNOSTIC
         if (logRef) {
             LogStr(logRef, "  id="); LogShort(logRef, id);
             LogStr(logRef, " err="); LogShort(logRef, err);
             LogStr(logRef, " stat=");LogShort(logRef, stat);
         }
+#endif
 
         if (err == noErr && stat == 0) {
             unsigned char *vendor = &inq[8];
@@ -300,18 +421,24 @@ static short DiscoverBlueScsiID(short logRef)
                             InqContains(prod,   16, "SCSI/LINK")||
                             InqContains(prod,   16, "DAYNA");
 
+#if BLUESCSI_SLEEP_DIAGNOSTIC
             if (logRef) {
                 long n8 = 8, n16 = 16;
                 LogStr(logRef, " v=\""); FSWrite(logRef, &n8,  (Ptr)vendor);
                 LogStr(logRef, "\" p=\"");FSWrite(logRef, &n16, (Ptr)prod);
                 LogStr(logRef, "\"");
             }
+#endif
             if (match && found < 0) {
                 found = id;
+#if BLUESCSI_SLEEP_DIAGNOSTIC
                 if (logRef) LogStr(logRef, " <- match");
+#endif
             }
         }
+#if BLUESCSI_SLEEP_DIAGNOSTIC
         if (logRef) LogStr(logRef, "\r");
+#endif
     }
     return found;
 }
@@ -321,54 +448,82 @@ static short DiscoverBlueScsiID(short logRef)
 static pascal void ReinitViaNotification(NMRecPtr nmReqPtr)
 {
     ExtState *state = (ExtState *)nmReqPtr->nmRefCon;
-    short     logRef = 0;
     OSErr     scsiErr;
     short     scsiStat;
+#if BLUESCSI_SLEEP_DIAGNOSTIC
+    short     logRef = 0;
+#endif
 
-    /* Clear the pending flag before doing any work so a rapid sleep/wake
-     * cycle during reinit can queue another notification. */
+    /* Clear pending flag before doing work so a rapid sleep/wake cycle
+     * during reinit can queue another notification. */
     state->nmPending = 0;
     state->wakeCount++;
 
-    /* First wake: discover the BlueSCSI ID and log the bus walk so the
-     * user can confirm the right target was selected.  Subsequent wakes
-     * skip this entirely. */
-    if (state->scsiID < 0) {
-        logRef = LogOpen(state);
-        if (logRef) {
-            LogStr(logRef, "=== BlueSCSI Sleep INIT active ===\r");
-            LogStr(logRef, "Walking SCSI bus:\r");
+    /* First wake: discover BlueSCSI ID.  In diagnostic builds, also
+     * log the bus walk so the user can verify the right target was
+     * selected.  Diagnostic builds additionally log a "=== Wake N ==="
+     * marker on every wake. */
+#if BLUESCSI_SLEEP_DIAGNOSTIC
+    logRef = LogOpen(state);
+    if (logRef) {
+        if (state->wakeCount == 1) {
+            LogStr(logRef, "=== BlueSCSI Sleep INIT (diagnostic) active ===\r");
         }
+        LogStr(logRef, "=== Wake ");
+        LogShort(logRef, state->wakeCount);
+        LogStr(logRef, " ===\r");
+    }
+    if (state->scsiID < 0) {
+        if (logRef) LogStr(logRef, "Walking SCSI bus:\r");
         state->scsiID = DiscoverBlueScsiID(logRef);
         if (logRef) {
             if (state->scsiID >= 0) {
-                LogStr(logRef, "Selected SCSI ID=");
-                LogShort(logRef, state->scsiID);
+                LogStr(logRef, "Selected SCSI ID="); LogShort(logRef, state->scsiID);
                 LogStr(logRef, "\r");
             } else {
-                LogStr(logRef, "BlueSCSI DaynaPORT not detected on SCSI bus.\r");
-                LogStr(logRef, "INIT will retry discovery on next wake.\r");
+                LogStr(logRef, "BlueSCSI DaynaPORT not detected.\r");
             }
         }
+    }
+#else
+    if (state->scsiID < 0) {
+        state->scsiID = DiscoverBlueScsiID();
+    }
+#endif
+
+    /* Discovery alert is sticky (once per session). */
+    if (state->scsiID < 0 && !state->discoveryAlertShown) {
+        state->discoveryAlertShown = true;
+        PostErrorAlert(state,
+            "BlueSCSI Sleep INIT: DaynaPORT not detected on the SCSI bus. "
+            "INIT will retry on each wake.",
+            false, 0, 0, NULL);
     }
 
     /* Wake-time reinit: SCSI 0x0E enable.  Bypasses the .ENET driver
      * and OT — speaks straight to the BlueSCSI firmware. */
     if (state->scsiID >= 0) {
         scsiErr = ScsiToggleInterface(state->scsiID, true, &scsiStat);
+#if BLUESCSI_SLEEP_DIAGNOSTIC
+        if (logRef) {
+            LogStr(logRef, "SCSI 0x0E enable id="); LogShort(logRef, state->scsiID);
+            LogStr(logRef, " err=");                LogShort(logRef, scsiErr);
+            LogStr(logRef, " stat=");               LogShort(logRef, scsiStat);
+            LogStr(logRef, "\r");
+        }
+#endif
         if (scsiErr != noErr || scsiStat != 0) {
-            if (logRef == 0) logRef = LogOpen(state);
-            if (logRef) {
-                LogStr(logRef, "Wake ");      LogShort(logRef, state->wakeCount);
-                LogStr(logRef, ": SCSI 0x0E enable id="); LogShort(logRef, state->scsiID);
-                LogStr(logRef, " err=");      LogShort(logRef, scsiErr);
-                LogStr(logRef, " stat=");     LogShort(logRef, scsiStat);
-                LogStr(logRef, "\r");
-            }
+            PostErrorAlert(state,
+                "BlueSCSI Sleep INIT: SCSI 0x0E enable failed.",
+                true, scsiErr, scsiStat,
+                "  Network may not recover until restart.");
         }
     }
 
+#if BLUESCSI_SLEEP_DIAGNOSTIC
     if (logRef) LogClose(logRef, state->logSpec.vRefNum);
+#endif
+
     NMRemove(nmReqPtr);
 }
 
@@ -376,8 +531,7 @@ static pascal void ReinitViaNotification(NMRecPtr nmReqPtr)
 
 long SleepQCallbackImpl(long message, SleepQRecPtr qRecPtr)
 {
-    /* SleepQRec is the first field of ExtState, so qRecPtr == &state. */
-    ExtState *state = (ExtState *)qRecPtr;
+    ExtState *state = (ExtState *)qRecPtr;  /* sleepRec at offset 0 */
 
     if (message == sleepWakeUp && !state->nmPending) {
         state->nmPending = 1;
@@ -405,14 +559,15 @@ extern long SleepQGlue(void);
  * text+data block, adding `delta` to each kind-0/code and kind-1/data
  * longword so internal absolute references point into the copy.
  *
- * Format (see libretro/relocate.c): a uleb128 stream terminated by a 0
- * byte; each record encodes (offset_increment << 2) | kind.  kind 0=code,
- * 1=data, 2=bss, 3=jump-table.
+ * Format (see libretro/relocate.c): uleb128 stream terminated by a 0
+ * byte; each record encodes (offset_increment << 2) | kind.
+ * kind 0=code, 1=data, 2=bss, 3=jump-table.
  *
- * BSS (kind 2) is shared with the original allocation, so we leave those
- * longwords alone.  Jump-table (kind 3) does not apply to flat-mac code
- * resources.  We skip the relative-relocation pass entirely: PC-relative
- * offsets within the block are preserved by a verbatim copy.
+ * BSS (kind 2) is shared with the original allocation, so we leave
+ * those longwords alone.  Jump-table (kind 3) does not apply to
+ * flat-mac code resources.  We skip the relative-relocation pass
+ * entirely: PC-relative offsets within the block are preserved by
+ * a verbatim copy.
  */
 static void RelocateCopyAbs(unsigned char *newCode, unsigned char *reloc,
                             long delta)
@@ -452,14 +607,15 @@ void _start(void)
     ExtState      *state;
     unsigned char *origBase, *newCode;
     long           textDataSize, delta;
-    void          *copiedGlue, *copiedNmResp;
+    void          *copiedGlue, *copiedNmResp, *copiedErrResp;
 
     RETRO68_RELOCATE();
     Retro68CallConstructors();
 
     /* Copy text+data into a System-heap block and fix up absolute
-     * relocations so callbacks dispatched after _start() exits land in
-     * the copy — the original 'INIT' resource doesn't survive boot. */
+     * relocations so callbacks dispatched after _start() exits land
+     * in the copy — the original 'INIT' resource doesn't survive
+     * boot. */
     origBase     = &_stext;
     textDataSize = (long)(&_edata - &_stext);
     newCode = (unsigned char *)NewPtrSysClear(textDataSize);
@@ -468,15 +624,17 @@ void _start(void)
     delta = (long)newCode - (long)origBase;
     RelocateCopyAbs(newCode, &_edata, delta);
 
-    copiedGlue   = (void *)((char *)&SleepQGlue            + delta);
-    copiedNmResp = (void *)((char *)&ReinitViaNotification + delta);
+    copiedGlue    = (void *)((char *)&SleepQGlue            + delta);
+    copiedNmResp  = (void *)((char *)&ReinitViaNotification + delta);
+    copiedErrResp = (void *)((char *)&ErrorAlertResp        + delta);
 
     state = (ExtState *)NewPtrSysClear(sizeof(ExtState));
     if (state == NULL) goto done;
-    state->scsiID = -1;   /* lazily discovered on first wake */
+    state->scsiID              = -1;     /* lazily discovered on first wake */
+    state->copiedErrorAlertResp = copiedErrResp;
 
-    /* Silent NM record — no mark, no icon, no sound, no alert string.
-     * nmResp runs at task level after each sleepWakeUp. */
+    /* Silent wake NM record — no mark, no icon, no sound, no alert
+     * string.  nmResp runs at task level after each sleepWakeUp. */
     state->nmRec.qType    = nmType;
     state->nmRec.nmMark   = 0;
     state->nmRec.nmIcon   = NULL;

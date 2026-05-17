@@ -1,10 +1,5 @@
 # BlueSCSI DaynaPORT sleep/wake handler
 #
-# Builds two targets:
-#
-#   BlueSCSISleep      — standalone application (launch manually before sleeping)
-#   BlueSCSISleepINIT  — System Extension that loads at boot (preferred)
-#
 # Build (68k, from the repo root):
 #
 #   mkdir build && cd build
@@ -12,71 +7,63 @@
 #     -DCMAKE_TOOLCHAIN_FILE=~/Git/Retro68-build/toolchain/\
 #         m68k-apple-macos/cmake/retro68.toolchain.cmake
 #   make
+#
+# Produces (in build/):
+#
+#   BlueSCSISleepINIT.bin       — production INIT (silent on success)
+#   BlueSCSISleepINIT-diag.bin  — diagnostic INIT (verbose log + alerts)
+#
+# Both binaries are built from init.c; the diagnostic variant is
+# compiled with -DBLUESCSI_SLEEP_DIAGNOSTIC=1.
 
 cmake_minimum_required(VERSION 3.10)
 project(BlueSCSISleep C)
 
 set(CMAKE_C_STANDARD 90)
 
-# ── Application version ───────────────────────────────────────────────────────
-add_application(BlueSCSISleep
-    main.c
-)
-target_compile_options(BlueSCSISleep PRIVATE
-    -O1 -Wall -Wno-main -ffunction-sections -fdata-sections)
-set_target_properties(BlueSCSISleep PROPERTIES
-    LINK_FLAGS "-Wl,-gc-sections")
-target_link_libraries(BlueSCSISleep PRIVATE
-    OpenTransport
-    OpenTransportExtn
-    OpenTptInet)
-
-# ── System Extension (INIT) version ──────────────────────────────────────────
-
-# Step 1: build the flat code resource binary
-add_executable(BlueSCSISleepINIT
-    init.c
-)
-set_target_properties(BlueSCSISleepINIT PROPERTIES
-    OUTPUT_NAME BlueSCSISleepINIT.flt
-    LINK_FLAGS  -Wl,--mac-flat)
-target_compile_options(BlueSCSISleepINIT PRIVATE -O1 -Wall -Wno-main)
-
 if(REZ_INCLUDE_PATH)
     set(REZ_INCLUDE_FLAG -I${REZ_INCLUDE_PATH})
 endif()
 
-# Step 2: Rez packages the .flt as an 'INIT' resource inside a Mac binary
-add_custom_command(
-    OUTPUT  BlueSCSISleepINIT.bin BlueSCSISleepINIT.dsk
-    COMMAND ${REZ} ${REZ_INCLUDE_FLAG}
-                   ${CMAKE_CURRENT_SOURCE_DIR}/init.r
-                   -o BlueSCSISleepINIT.bin
-                   --cc BlueSCSISleepINIT.dsk
-                   --cc BlueSCSISleepINIT
-                   -t INIT
-    DEPENDS BlueSCSISleepINIT init.r)
+# ── Helper: build an INIT variant from a source + rez file ──────────────────
+#
+# add_bluescsi_init_variant(<target> <output-stem> <source-c> <rez-file>
+#                           [DEFINES <macro=value>...])
+#
+# Produces <output-stem>.flt, <output-stem>.bin, <output-stem>.dsk.
+function(add_bluescsi_init_variant target output_stem source_c rez_file)
+    cmake_parse_arguments(BSI "" "" "DEFINES" ${ARGN})
 
-add_custom_target(BlueSCSISleepINIT_INIT ALL DEPENDS BlueSCSISleepINIT.dsk)
+    add_executable(${target} ${source_c})
+    set_target_properties(${target} PROPERTIES
+        OUTPUT_NAME ${output_stem}.flt
+        LINK_FLAGS  -Wl,--mac-flat)
+    target_compile_options(${target} PRIVATE -O1 -Wall -Wno-main)
+    if(BSI_DEFINES)
+        target_compile_definitions(${target} PRIVATE ${BSI_DEFINES})
+    endif()
 
-# ── Minimal diagnostic INIT (do-nothing _start) ───────────────────────────
+    add_custom_command(
+        OUTPUT  ${output_stem}.bin ${output_stem}.dsk
+        COMMAND ${REZ} ${REZ_INCLUDE_FLAG}
+                       ${CMAKE_CURRENT_SOURCE_DIR}/${rez_file}
+                       -o ${output_stem}.bin
+                       --cc ${output_stem}.dsk
+                       --cc ${output_stem}
+                       -t INIT
+        DEPENDS ${target} ${rez_file})
+    add_custom_target(${target}_INIT ALL DEPENDS ${output_stem}.dsk)
+endfunction()
 
-add_executable(BlueSCSISleepMinimalINIT
-    init_minimal.c
-)
-set_target_properties(BlueSCSISleepMinimalINIT PROPERTIES
-    OUTPUT_NAME BlueSCSISleepMinimalINIT.flt
-    LINK_FLAGS  -Wl,--mac-flat)
-target_compile_options(BlueSCSISleepMinimalINIT PRIVATE -O1 -Wall -Wno-main)
+# ── Production INIT (silent on success; alerts on error) ────────────────────
+add_bluescsi_init_variant(BlueSCSISleepINIT
+                          BlueSCSISleepINIT
+                          init.c
+                          init.r)
 
-add_custom_command(
-    OUTPUT  BlueSCSISleepMinimalINIT.bin BlueSCSISleepMinimalINIT.dsk
-    COMMAND ${REZ} ${REZ_INCLUDE_FLAG}
-                   ${CMAKE_CURRENT_SOURCE_DIR}/init_minimal.r
-                   -o BlueSCSISleepMinimalINIT.bin
-                   --cc BlueSCSISleepMinimalINIT.dsk
-                   --cc BlueSCSISleepMinimalINIT
-                   -t INIT
-    DEPENDS BlueSCSISleepMinimalINIT init_minimal.r)
-
-add_custom_target(BlueSCSISleepMinimalINIT_INIT ALL DEPENDS BlueSCSISleepMinimalINIT.dsk)
+# ── Diagnostic INIT (verbose log + alerts) ──────────────────────────────────
+add_bluescsi_init_variant(BlueSCSISleepINITDiag
+                          BlueSCSISleepINIT-diag
+                          init.c
+                          init-diag.r
+                          DEFINES BLUESCSI_SLEEP_DIAGNOSTIC=1)
