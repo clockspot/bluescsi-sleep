@@ -5,15 +5,9 @@
  * to the log, NMRemove.
  *
  * If sleep+wake produces a "Wake N" entry in BlueSCSI Sleep Log, we've
- * validated:
- *   • NMInstall called from relocated interrupt-level code.
- *   • OS dispatches into relocated nmResp at task level.
- *   • String literals in .data are reachable via the relocated kind-1
- *     references (LogStr writes the right bytes).
- *   • Task-level File Manager I/O from the relocated code works.
- *
- * Step 10 then bulk-ports init.c's driver-search + KillIO + PBControl into
- * the same skeleton — no new mechanism. */
+ * validated the copy-and-relocate skeleton end-to-end. The OT probe lives
+ * in the BlueSCSISleep app (main.c) so it can be re-run on demand without
+ * blocking the wake handler. */
 #include <MacTypes.h>
 #include <Memory.h>
 #include <Power.h>

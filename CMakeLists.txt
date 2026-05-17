@@ -22,7 +22,14 @@ set(CMAKE_C_STANDARD 90)
 add_application(BlueSCSISleep
     main.c
 )
-target_compile_options(BlueSCSISleep PRIVATE -O1 -Wall -Wno-main)
+target_compile_options(BlueSCSISleep PRIVATE
+    -O1 -Wall -Wno-main -ffunction-sections -fdata-sections)
+set_target_properties(BlueSCSISleep PROPERTIES
+    LINK_FLAGS "-Wl,-gc-sections")
+target_link_libraries(BlueSCSISleep PRIVATE
+    OpenTransport
+    OpenTransportExtn
+    OpenTptInet)
 
 # ── System Extension (INIT) version ──────────────────────────────────────────
 

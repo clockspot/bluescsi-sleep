@@ -6,3 +6,6 @@ build/
 
 # MacsBug crash dumps (development scratch)
 MacsBug/
+
+# Capturing some Claude chat for reference later
+scratch/

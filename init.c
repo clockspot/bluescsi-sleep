@@ -71,6 +71,7 @@
 #include <Notification.h>
 #include <OSUtils.h>
 #include <Resources.h>
+#include <SCSI.h>
 #include <string.h>
 #include "Retro68Runtime.h"
 
@@ -112,6 +113,8 @@ typedef struct ExtState {
     unsigned char   _pad2;
     FSSpec          logSpec;
     NMRec           nmRec;
+    short           scsiID;         /* BlueSCSI SCSI ID; -1 = not yet discovered */
+    short           _pad3;
 } ExtState;
 
 /* ── A5-free logging helpers ─────────────────────────────────────────────── */
@@ -345,6 +348,196 @@ static void LogDriverProbe(short logRef, short ref, const char *label)
     LogStr(logRef, "\r");
 }
 
+/* ── SCSI Manager helpers (old/sync API; inline _SCSIDispatch traps) ────── */
+
+/*
+ * Issue a SCSI command with no data transfer.  Returns the SCSI Manager
+ * error from the worst-failing call in the GET/SELECT/CMD/COMPLETE sequence;
+ * also writes the device-side status byte into *outStat (0 = GOOD).
+ *
+ * Safe to call only at task level.  Caller is responsible for ensuring no
+ * other I/O is in flight to this target (e.g. KillIO on the .ENET driver
+ * first if it owns this SCSI ID).
+ */
+static OSErr ScsiCmdNoData(short id, const unsigned char *cdb, short cdbLen,
+                           short *outStat)
+{
+    OSErr   err, getErr;
+    short   stat = 0, msg = 0;
+
+    *outStat = 0;
+
+    getErr = SCSIGet();
+    if (getErr != noErr) return getErr;
+
+    err = SCSISelect(id);
+    if (err != noErr) goto done;
+
+    err = SCSICmd((Ptr)cdb, cdbLen);
+    if (err != noErr) goto done;
+
+done:
+    /* SCSIComplete must be called even on error to release the bus.
+     * 60 ticks = ~1 s — generous for a no-data control command. */
+    {
+        OSErr compErr = SCSIComplete(&stat, &msg, 60);
+        *outStat = stat;
+        if (err == noErr) err = compErr;
+    }
+    return err;
+}
+
+/*
+ * Issue SCSI INQUIRY (0x12) and read the first 36 bytes into outBuf.
+ * Uses a 2-instruction TIB: scInc to transfer 36 bytes, then scStop.
+ */
+static OSErr ScsiInquiry(short id, unsigned char outBuf[36], short *outStat)
+{
+    OSErr             err, getErr;
+    short             stat = 0, msg = 0;
+    SCSIInstr         tib[2];
+    unsigned char     cdb[6];
+
+    *outStat = 0;
+    memset(outBuf, 0, 36);
+
+    cdb[0] = 0x12;          /* INQUIRY */
+    cdb[1] = 0;
+    cdb[2] = 0;
+    cdb[3] = 0;
+    cdb[4] = 36;            /* allocation length */
+    cdb[5] = 0;
+
+    tib[0].scOpcode = scInc;
+    tib[0].scParam1 = (long)outBuf;
+    tib[0].scParam2 = 36;
+    tib[1].scOpcode = scStop;
+    tib[1].scParam1 = 0;
+    tib[1].scParam2 = 0;
+
+    getErr = SCSIGet();
+    if (getErr != noErr) return getErr;
+
+    err = SCSISelect(id);
+    if (err != noErr) goto done;
+
+    err = SCSICmd((Ptr)cdb, 6);
+    if (err != noErr) goto done;
+
+    err = SCSIRead((Ptr)tib);
+    if (err != noErr) goto done;
+
+done:
+    {
+        OSErr compErr = SCSIComplete(&stat, &msg, 60);
+        *outStat = stat;
+        if (err == noErr) err = compErr;
+    }
+    return err;
+}
+
+/*
+ * Issue Dayna SCSI/Link 0x0E "toggle interface".  BlueSCSI's firmware
+ * (lib/SCSI2SD/src/firmware/network.c) checks `cdb[5] & 0x80`:
+ *
+ *   cdb[5] = 0x80  → scsiNetworkEnabled = true; inbound queue cleared
+ *   cdb[5] = 0x00  → scsiNetworkEnabled = false
+ *
+ * That's the entire effect — no WiFi reset, no buffer reinit beyond the
+ * inbound queue.  Plausibly useful after a sleep that left BlueSCSI's
+ * enabled flag or inbound queue in an inconsistent state; not useful for
+ * anything heavier.
+ *
+ * Bypasses the .ENET driver and OT entirely.
+ */
+static OSErr ScsiToggleInterface(short id, Boolean enable, short *outStat)
+{
+    unsigned char cdb[6];
+    cdb[0] = 0x0E;
+    cdb[1] = 0;
+    cdb[2] = 0;
+    cdb[3] = 0;
+    cdb[4] = 0;
+    cdb[5] = enable ? 0x80 : 0x00;
+    return ScsiCmdNoData(id, cdb, 6, outStat);
+}
+
+/*
+ * Compare an inquiry vendor/product field (space-padded ASCII) against a
+ * needle.  Case-insensitive substring match.  needle is a C string.
+ */
+static Boolean InqContains(const unsigned char *field, short fieldLen,
+                           const char *needle)
+{
+    short i, j, n = 0;
+    while (needle[n]) n++;
+    if (n == 0 || n > fieldLen) return false;
+    for (i = 0; i <= fieldLen - n; i++) {
+        for (j = 0; j < n; j++) {
+            unsigned char a = field[i + j];
+            unsigned char b = (unsigned char)needle[j];
+            if (a >= 'a' && a <= 'z') a -= 32;
+            if (b >= 'a' && b <= 'z') b -= 32;
+            if (a != b) break;
+        }
+        if (j == n) return true;
+    }
+    return false;
+}
+
+/*
+ * Walk SCSI IDs 0–6 and look for the BlueSCSI DaynaPORT emulation.
+ * Logs each ID's inquiry response so the user can see exactly what's on
+ * the bus.  Returns the first ID whose vendor or product field looks like
+ * a DaynaPORT, or -1 if nothing matched.
+ *
+ * Heuristic: match "DAYNA" or "SCSI/LINK" in vendor or product.
+ * (Real BlueSCSI hardware reports vendor="Dayna" product="SCSI/Link"
+ * with peripheral type 0x03 "processor device", NOT 0x09 "communications"
+ * as the original Dayna spec implies.  HDD emulations on the same bus
+ * legitimately put "BlueSCSI" in their product field, so we don't match
+ * on the BlueSCSI string — it would catch the wrong target.)
+ */
+static short DiscoverBlueScsiID(short logRef)
+{
+    short          id, found = -1;
+    unsigned char  inq[36];
+    OSErr          err;
+    short          stat;
+
+    for (id = 0; id <= 6; id++) {
+        err = ScsiInquiry(id, inq, &stat);
+        if (logRef) {
+            LogStr(logRef, "  SCSI id=");  LogShort(logRef, id);
+            LogStr(logRef, " err=");       LogShort(logRef, err);
+            LogStr(logRef, " stat=");      LogShort(logRef, stat);
+        }
+        if (err == noErr && stat == 0) {
+            unsigned char  pdt    = inq[0] & 0x1F;
+            unsigned char *vendor = &inq[8];
+            unsigned char *prod   = &inq[16];
+            Boolean        match;
+
+            if (logRef) {
+                long n8 = 8, n16 = 16;
+                LogStr(logRef, " pdt=");   LogHex8(logRef, pdt);
+                LogStr(logRef, " v=\"");   FSWrite(logRef, &n8,  (Ptr)vendor);
+                LogStr(logRef, "\" p=\""); FSWrite(logRef, &n16, (Ptr)prod);
+                LogStr(logRef, "\"");
+            }
+            match = InqContains(vendor, 8,  "DAYNA")    ||
+                    InqContains(prod,   16, "SCSI/LINK")||
+                    InqContains(prod,   16, "DAYNA");
+            if (match && found < 0) {
+                found = id;
+                if (logRef) LogStr(logRef, " <- match");
+            }
+        }
+        if (logRef) LogStr(logRef, "\r");
+    }
+    return found;
+}
+
 /* ── task-level reinit (Notification Manager nmResp, no A5) ─────────────── */
 
 /*
@@ -424,6 +617,29 @@ static pascal void ReinitViaNotification(NMRecPtr nmReqPtr)
         if (logRef) LogStr(logRef, "No driver found, skipping reinit\r");
     }
 
+    /* SCSI 0x0E enable — bypasses .ENET driver and OT to kick the BlueSCSI
+     * firmware's Ethernet state machine.  Driver-level KillIO above has
+     * already canceled any pending I/O, so the bus should be quiet. */
+    if (state->scsiID < 0) {
+        if (logRef) LogStr(logRef, "Discovering BlueSCSI ID:\r");
+        state->scsiID = DiscoverBlueScsiID(logRef);
+        if (logRef) {
+            LogStr(logRef, "Selected SCSI ID=");
+            LogShort(logRef, state->scsiID);
+            LogStr(logRef, "\r");
+        }
+    }
+    if (state->scsiID >= 0) {
+        short scsiStat = 0;
+        OSErr scsiErr  = ScsiToggleInterface(state->scsiID, true, &scsiStat);
+        if (logRef) {
+            LogStr(logRef, "SCSI 0x0E enable id=");  LogShort(logRef, state->scsiID);
+            LogStr(logRef, " err=");                 LogShort(logRef, scsiErr);
+            LogStr(logRef, " stat=");                LogShort(logRef, scsiStat);
+            LogStr(logRef, "\r");
+        }
+    }
+
     if (logRef) LogClose(logRef, state->logSpec.vRefNum);
 
     NMRemove(nmReqPtr);
@@ -437,7 +653,9 @@ long SleepQCallbackImpl(long message, SleepQRecPtr qRecPtr)
     ExtState *state = (ExtState *)qRecPtr;
 
     /* sleepDemand fires at task level just before the machine actually
-     * sleeps.  Probe the driver here to capture a known-good baseline. */
+     * sleeps.  Probe the driver here to capture a known-good baseline,
+     * then disable the BlueSCSI interface so the firmware-level Ethernet
+     * state machine is in a known-clean state on wake. */
     if (message == sleepDemand) {
         short logRef = LogOpen(state);
         short ref    = state->driverRefNum;
@@ -451,8 +669,31 @@ long SleepQCallbackImpl(long message, SleepQRecPtr qRecPtr)
             LogStr(logRef, ") ===\r");
             if (ref != 0) LogDriverProbe(logRef, ref, "Pre-sleep");
             else          LogStr(logRef, "No driver found at sleep time\r");
-            LogClose(logRef, state->logSpec.vRefNum);
         }
+
+        if (state->scsiID < 0) {
+            if (logRef) LogStr(logRef, "Discovering BlueSCSI ID:\r");
+            state->scsiID = DiscoverBlueScsiID(logRef);
+            if (logRef) {
+                LogStr(logRef, "Selected SCSI ID=");
+                LogShort(logRef, state->scsiID);
+                LogStr(logRef, "\r");
+            }
+        }
+        if (state->scsiID >= 0) {
+            short scsiStat = 0;
+            OSErr scsiErr;
+            if (ref != 0) (void)KillIO(ref);   /* quiet the driver first */
+            scsiErr = ScsiToggleInterface(state->scsiID, false, &scsiStat);
+            if (logRef) {
+                LogStr(logRef, "SCSI 0x0E disable id=");  LogShort(logRef, state->scsiID);
+                LogStr(logRef, " err=");                  LogShort(logRef, scsiErr);
+                LogStr(logRef, " stat=");                 LogShort(logRef, scsiStat);
+                LogStr(logRef, "\r");
+            }
+        }
+
+        if (logRef) LogClose(logRef, state->logSpec.vRefNum);
     }
 
     if (message == sleepWakeUp && !state->nmPending) {
@@ -549,6 +790,7 @@ void _start(void)
 
     state = (ExtState *)NewPtrSysClear(sizeof(ExtState));
     if (state == NULL) goto done;
+    state->scsiID = -1;   /* lazily discovered at first sleep/wake */
 
     /* Initialise the Notification Manager record.
      * Silent notification — no mark, no icon, no sound, no alert string.

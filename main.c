@@ -11,10 +11,13 @@
 #include <MacTypes.h>
 #include <Quickdraw.h>
 #include <Devices.h>
+#include <Events.h>
 #include <Files.h>
 #include <Folders.h>
 #include <Memory.h>
 #include <OSUtils.h>
+#include <OpenTransport.h>
+#include <OpenTptInternet.h>
 #include <string.h>
 
 /* ── low-memory Unit Table ───────────────────────────────────────────────── */
@@ -84,6 +87,83 @@ static void LogShort(short ref, short val)
     if (neg) buf[--i] = '-';
     n = 7 - i;
     FSWrite(ref, &n, buf + i);
+}
+
+static void LogByte(short ref, unsigned char v)
+{
+    char  buf[3];
+    short i = 3;
+    long  n;
+    if (v == 0) buf[--i] = '0';
+    else        while (v) { buf[--i] = (char)('0' + v % 10); v /= 10; }
+    n = 3 - i;
+    FSWrite(ref, &n, buf + i);
+}
+
+static void LogDotted(short ref, unsigned long ip)
+{
+    LogByte(ref, (unsigned char)((ip >> 24) & 0xFF));
+    LogStr (ref, ".");
+    LogByte(ref, (unsigned char)((ip >> 16) & 0xFF));
+    LogStr (ref, ".");
+    LogByte(ref, (unsigned char)((ip >>  8) & 0xFF));
+    LogStr (ref, ".");
+    LogByte(ref, (unsigned char)( ip        & 0xFF));
+}
+
+static void LogElapsed(short ref, unsigned long start)
+{
+    unsigned long elapsed = TickCount() - start;
+    LogStr(ref, " t=");
+    if (elapsed > 32767) elapsed = 32767;
+    LogShort(ref, (short)elapsed);
+}
+
+/* ── OT probe (TN1145 lazy-recreate dance) ──────────────────────────────── */
+
+static void OTProbe(short logRef)
+{
+    OSStatus      err;
+    InetSvcRef    svc = kOTInvalidProviderRef;
+    InetHostInfo  hinfo;
+    unsigned long t0;
+    static char   kProbeHost[] = "www.google.com";
+
+    if (logRef == 0) return;
+
+    LogStr(logRef, "  [OT] InitOpenTransport...");
+    t0  = TickCount();
+    err = InitOpenTransport();
+    LogStr(logRef, " err="); LogShort(logRef, (short)err);
+    LogElapsed(logRef, t0);
+    LogStr(logRef, "\r");
+    if (err != noErr) return;
+
+    LogStr(logRef, "  [OT] OTOpenInternetServices...");
+    t0  = TickCount();
+    svc = OTOpenInternetServices(kDefaultInternetServicesPath, 0, &err);
+    LogStr(logRef, " err="); LogShort(logRef, (short)err);
+    LogElapsed(logRef, t0);
+    LogStr(logRef, "\r");
+
+    if (err == noErr && svc != kOTInvalidProviderRef) {
+        LogStr(logRef, "  [OT] OTInetStringToAddress(\"");
+        LogStr(logRef, kProbeHost);
+        LogStr(logRef, "\")...");
+        t0  = TickCount();
+        err = OTInetStringToAddress(svc, kProbeHost, &hinfo);
+        LogStr(logRef, " err="); LogShort(logRef, (short)err);
+        LogElapsed(logRef, t0);
+        if (err == noErr) {
+            LogStr(logRef, " ip=");
+            LogDotted(logRef, hinfo.addrs[0]);
+        }
+        LogStr(logRef, "\r");
+        OTCloseProvider(svc);
+    }
+
+    CloseOpenTransport();
+    LogStr(logRef, "  [OT] CloseOpenTransport done\r");
 }
 
 /* ── driver finding ──────────────────────────────────────────────────────── */
@@ -164,6 +244,8 @@ int main(void)
 
     logRef = LogOpen();
     if (logRef) LogStr(logRef, "=== BlueSCSI Reinit App ===\r");
+
+    OTProbe(logRef);
 
     ref = FindAndLogDriver(logRef);
 
