@@ -1,29 +1,60 @@
 # bluescsi-sleep
 
-A Macintosh System 7 extension intended to fix the DaynaPORT SCSI/Link driver not recovering after sleep/wake. For use with [BlueSCSI](https://bluescsi.com)'s WiFi-via-DaynaPORT-emulation feature.
+A System 7 extension that recovers the [BlueSCSI](https://bluescsi.com) DaynaPORT (WiFi) network after the Mac wakes from sleep — automatically, with no user action required.
 
-**Status:** work in progress. Tested on a PowerBook 180 running System 7.5.5 with Open Transport. The INIT loads, installs a Sleep Queue handler, and survives boot via a copy-and-relocate workaround for a Retro68-specific code-resource lifetime issue (see "Note on Retro68 INIT lifetime" below). Driver-level reinit calls (`KillIO` + `PBControlSync`) execute cleanly but do **not** by themselves restore Open Transport's network stack; the OT-layer reinit mechanism is still being investigated.
+Tested on a PowerBook 180 running System 7.5.5 with Open Transport and a BlueSCSI v2 (Pico W) in WiFi-DaynaPORT mode. Should work on any 68k Mac with deep sleep and a BlueSCSI emulating a Dayna SCSI/Link device. Developed with Claude Code.
 
-Developed with Claude Code.
+## The problem
+
+When a PowerBook wakes from sleep, the DaynaPORT network does not come back. The `.ENET` driver still responds to status probes, and Open Transport itself reloads cleanly, but the very first TCP/IP service call (`OTOpenInternetServices`, or anything an app like iCab does) hangs for ~90 seconds and then fails with `kEHOSTUNREACHErr` (-3259). The only manual recoveries are a warm reboot or reseating the BlueSCSI; toggling TCP/IP in the control panel does not help.
+
+The cause is in the BlueSCSI firmware: after the PowerBook's deep sleep, BlueSCSI's per-target `scsiNetworkEnabled` flag and inbound packet queue end up in an inconsistent state, and the Mac-side driver doesn't know it needs to re-issue the enable command (it only sends it at driver-open time, which doesn't happen on wake).
+
+## The fix
+
+The extension installs a Sleep Queue callback. On every `sleepWakeUp`, a task-level Notification Manager callback sends Dayna SCSI/Link command `0x0E` (toggle interface, enable variant) directly to the BlueSCSI SCSI ID via the synchronous SCSI Manager. This bypasses the `.ENET` driver and Open Transport entirely — it speaks straight to BlueSCSI's firmware, which resets the inbound queue and re-asserts the enabled flag. Network connectivity returns immediately.
+
+The BlueSCSI SCSI ID is discovered on the first wake by walking IDs 0–6 with `INQUIRY` (`0x12`) and matching "Dayna" or "SCSI/Link" in the vendor or product field. The result is cached for subsequent wakes.
+
+## Install
+
+1. Copy `build/BlueSCSISleepINIT.bin` to the System Folder's **Extensions** folder.
+2. Restart.
+
+After the first sleep/wake cycle, a one-time entry appears in `BlueSCSI Sleep Log` (in the System Folder) showing the SCSI bus walk and the selected target ID. Successful subsequent wakes are silent; only errors and undetected-bus cases get logged.
+
+## Build
+
+Requires [Retro68](https://github.com/autc04/Retro68).
+
+```
+mkdir build && cd build
+cmake .. \
+  -DCMAKE_TOOLCHAIN_FILE=~/Git/Retro68-build/toolchain/m68k-apple-macos/cmake/retro68.toolchain.cmake
+make
+```
+
+Produces:
+
+- `BlueSCSISleepINIT.bin` — the production INIT (install this).
+- `BlueSCSISleep.bin` — a standalone diagnostic app (see below).
+- `BlueSCSISleepMinimalINIT.bin` — a no-op INIT skeleton (validated copy-and-relocate + NM dance with no driver work), kept around for future diagnostic work.
 
 ## Repository contents
 
 | File | Role |
 | --- | --- |
-| `init.c` / `init.r` | The full System Extension — Sleep Queue + Notification Manager + driver reinit. Pre-dates the copy-and-relocate fix and currently crashes immediately on sleep; pending port of the mechanism proven in `init_minimal.c`. |
-| `init_minimal.c` / `init_minimal.r` | Diagnostic INIT used to bisect the crash. Currently at "step 9" — copy-and-relocate machinery plus a no-driver-work Notification Manager dance, validating the path forward. |
-| `main.c` | Standalone reinit utility. Run after wake, finds the driver, calls `KillIO` + `PBControlSync(csCode=0/1)`, writes a log to `BlueSCSI Sleep Log` in the System Folder, quits silently. |
+| `init.c` | Production INIT. Sleep Queue → Notification Manager → SCSI 0x0E enable. |
+| `init.r` | Rez source — packages the flat code resource as an `'INIT'` 128. |
+| `init_minimal.c` / `init_minimal.r` | Diagnostic skeleton — copy-and-relocate + NM round-trip with no driver work. Used during development; useful as a starting point for future on-wake experiments. |
+| `main.c` | Standalone diagnostic app. Walks the SCSI bus, runs an Open Transport probe (the TN1145 lazy-recreate dance — `InitOpenTransport`, `OTOpenInternetServices`, `OTInetStringToAddress`), and logs every step's err code and elapsed ticks to `BlueSCSI Sleep Log`. Run it after wake to see exactly where OT is failing if the production INIT isn't doing the right thing on a different setup. |
 | `CMakeLists.txt` | Retro68 build for all three targets. |
 
 ## How it works
 
-According to Claude Code:
+### What the INIT does, conceptually
 
-### What the extension does, conceptually
-
-The DaynaPORT network driver stops working after sleep because it was designed for a card plugged into a real NuBus slot. When the Mac wakes up, it does not automatically tell every driver "hey, reinitialise yourself." The BlueSCSI firmware can emulate the DaynaPORT hardware perfectly, but the driver still needs a nudge — specifically, a flush of its pending I/O queue and a reset command — before it will talk to the network again.
-
-The extension's job is: watch for every wake event, and when one happens, send that nudge to the driver.
+The DaynaPORT network appears broken after wake, but the BlueSCSI firmware is fine — it just needs a single SCSI command (`0x0E` enable) to reset its per-target network state. The Mac-side `.ENET` driver only sends that command at driver-open time, which doesn't happen on wake. So the INIT watches for wake events and sends the command itself.
 
 ### System Extensions (INITs)
 
@@ -31,7 +62,7 @@ On modern macOS you have login items, Launch Daemons, and kernel extensions. On 
 
 At startup, before the Finder appears, the System walks through the Extensions folder and runs every file it finds there. It does this by loading the file, finding a resource inside it of type `'INIT'`, and jumping to the code stored in that resource. Your `_start()` function is that entry point.
 
-Critically, after `_start()` returns, there is no process running your code. Classic Mac OS is co-operatively multitasked and single-threaded; there is no background thread you can leave spinning. So an INIT cannot just have a loop that checks a flag. Instead, it has to hook into the OS itself so the OS calls your code back at the right moments. That is exactly what the two hooks below do.
+Critically, after `_start()` returns, there is no process running your code. Classic Mac OS is co-operatively multitasked and single-threaded; there is no background thread you can leave spinning. So an INIT cannot just have a loop that checks a flag. Instead, it has to hook into the OS itself so the OS calls your code back at the right moments.
 
 ### The Sleep Queue
 
@@ -56,32 +87,31 @@ This is the most important concept in the whole file.
 
 Classic Mac OS runs on a 68030 CPU which supports **hardware interrupt levels** (0–7). When a hardware interrupt fires — a keypress, a mouse move, a timer tick, or a power-management event like a wake signal — the CPU pauses whatever it was doing, raises the interrupt level, and runs the interrupt service routine. While the interrupt level is elevated:
 
--   **No Toolbox calls are safe.** The Toolbox (the Mac's built-in GUI and OS library) is not re-entrant. If your interrupt fires while the Toolbox is in the middle of drawing a window, and your interrupt routine calls another Toolbox function, you will corrupt internal state and crash.
--   **Memory allocation is not safe** for the same reason.
--   **Only atomic operations are safe** — setting a boolean flag, incrementing a counter, reading a timer.
+- **No Toolbox calls are safe.** The Toolbox is not re-entrant. If your interrupt fires while it's in the middle of drawing a window, and your interrupt routine calls another Toolbox function, you'll corrupt internal state and crash.
+- **Memory allocation is not safe** for the same reason.
+- **The SCSI Manager is not safe.**
+- **Only atomic operations are safe** — setting a boolean flag, incrementing a counter, reading a timer.
 
 "Task level" means interrupt level 0 — normal code, running inside an application's event loop, where you can safely call any Toolbox function.
 
-`sleepWakeUp` fires at interrupt level. So in `SleepQCallbackImpl` all we do is call `NMInstall` to post a Notification Manager request:
+`sleepWakeUp` fires at interrupt level. So in `SleepQCallbackImpl` all we do is post a Notification Manager request:
 
-```
+```c
 if (message == sleepWakeUp && !state->nmPending) {
     state->nmPending = 1;
     NMInstall(&state->nmRec);
 }
 ```
 
-`NMInstall` is documented as interrupt-safe: it does no memory allocation and simply links the record into a queue. We then return, and the hardware interrupt finishes. The actual driver reset — which calls `KillIO` and `PBControlSync`, both Toolbox calls — is handled by the Notification Manager callback at task level.
+`NMInstall` is documented as interrupt-safe: it does no memory allocation and simply links the record into a queue. We then return, and the hardware interrupt finishes. The actual SCSI work — `SCSIGet`, `SCSISelect`, `SCSICmd`, `SCSIComplete` — is done by the Notification Manager callback at task level, where it's safe.
 
 ### The register-based calling convention and the asm glue
-
-Here the story gets a little weird.
 
 Modern CPUs pass function arguments on the stack or in specific registers according to a well-defined ABI. 68k Mac OS predates standard ABIs. Many OS callbacks use a **register-based convention**: the OS puts arguments in specific CPU registers (D0, A0, etc.) and jumps to your function. GCC (the compiler Retro68 uses) does not support this for parameters — it only generates stack-based function calls.
 
 So the file has a hand-written assembly stub, `SleepQGlue`, that sits between the OS and the C function:
 
-```
+```asm
 SleepQGlue:
     move.l %a0, -(%sp)       ; push qRecPtr (was in register A0) onto stack
     move.l %d0, -(%sp)       ; push message (was in register D0) onto stack
@@ -90,7 +120,7 @@ SleepQGlue:
     rts
 ```
 
-Think of it as a shim: it takes the OS's register-based calling convention and converts it to the stack-based convention that C expects. `SleepQCallbackImpl` is then a perfectly normal C function that takes two arguments.
+Think of it as a shim: it takes the OS's register-based calling convention and converts it to the stack-based convention that C expects.
 
 ### The A5 world problem
 
@@ -98,52 +128,35 @@ On classic Mac OS, each application has a private data segment in memory, and th
 
 When the OS calls your Sleep Queue callback, A5 holds the **current application's** A5 value, not yours. Your global variables are somewhere completely different. If you try to read or write your C globals inside a callback, you read garbage.
 
-For a standalone application (like the app version in `main.c`) this is not a problem — the application's own A5 is always set before the event loop runs, and the sleep callback fires while the app is running. But for an INIT, `_start()` returns and the INIT code has no application context at all. After `_start()` exits, whenever the OS calls your callback, A5 belongs to whichever application happens to be running at that moment.
-
-The solution is to **never use C globals in any callback**. All mutable state lives in a block of memory allocated with `NewPtrSys()` — a System heap allocation that does not depend on A5. You pass a pointer to that block through other means.
+The solution is to **never use C globals in any callback**. All mutable state lives in a block of memory allocated with `NewPtrSysClear()` — a System heap allocation that does not depend on A5. You pass a pointer to that block through other means.
 
 ### The ExtState block
 
-`NewPtrSys()` allocates memory from the **System heap** — a special region of memory that the OS owns and that persists for the entire life of the machine, regardless of which application is running or what A5 holds. It is the INIT equivalent of `malloc` with infinite lifetime.
+`NewPtrSysClear()` allocates memory from the **System heap** — a special region of memory that the OS owns and that persists for the entire life of the machine, regardless of which application is running or what A5 holds. It's the INIT equivalent of `malloc` with infinite lifetime, and it zeros the allocation for you.
 
-```
+```c
 typedef struct ExtState {
-    SleepQRec       sleepRec;      // The Sleep Queue record the OS holds a pointer to
-    short           driverRefNum;  // Which driver to reset
-    unsigned char   nmPending;     // 1 = notification already queued (prevents double-install)
-    unsigned char   _pad;          // Alignment byte
-    short           wakeCount;     // Number of wakes so far (for logging)
+    SleepQRec       sleepRec;       // The Sleep Queue record the OS holds a pointer to
+    unsigned char   nmPending;      // 1 = notification already queued (prevents double-install)
     Boolean         logSpecValid;
-    unsigned char   _pad2;
-    FSSpec          logSpec;       // Log file location
-    NMRec           nmRec;         // Notification Manager record (queued on every wake)
+    short           wakeCount;
+    short           scsiID;         // BlueSCSI SCSI ID; -1 = not yet discovered
+    short           _pad;
+    FSSpec          logSpec;        // Log file location (lazy)
+    NMRec           nmRec;          // Notification Manager record (re-queued on every wake)
 } ExtState;
 ```
 
 The critical design trick: `sleepRec` is the **first field**. When the OS calls the Sleep Queue callback, it hands you a pointer to the `SleepQRec` record you installed — i.e. `qRecPtr` points to `state->sleepRec`. Because `sleepRec` is first, `qRecPtr` and `state` have the same numeric address. The callback can cast `qRecPtr` to `ExtState*` and reach any field without ever touching A5.
 
-```
-long SleepQCallbackImpl(long message, SleepQRecPtr qRecPtr)
-{
-    ExtState *state = (ExtState *)qRecPtr;   // safe: same address, no A5
-    if (message == sleepWakeUp && !state->nmPending) {
-        state->nmPending = 1;
-        NMInstall(&state->nmRec);            // interrupt-safe; no allocation
-    }
-    return 0;
-}
-```
+### Task-level reinit via the Notification Manager
 
-### How the reinit happens at task level: the Notification Manager
+The SCSI Manager and File Manager are not interrupt-safe, but `sleepWakeUp` fires at interrupt level. The Notification Manager is the standard 68k bridge between these worlds: calling `NMInstall` from interrupt level asks the OS to run your `nmResp` callback the next time normal task-level code is executing.
 
-We need something to run at task level — normal code, not an interrupt — to do the actual driver reset after the wake. The Mac OS **Notification Manager** is designed for exactly this bridge.
+The Notification Manager record (`NMRec`) is embedded directly in the `ExtState` block. Its `nmRefCon` field holds a pointer back to the `ExtState` so the callback can reach the SCSI ID and log file without A5:
 
-Calling `NMInstall` from interrupt level asks the OS to run a callback (`nmResp`) the next time normal task-level code is executing — i.e., when the system is back to the application event loop. The OS handles all the mechanics of deferring the call safely. There is no polling, no overhead on every event, and no stored addresses that could become stale.
-
-The Notification Manager record (`NMRec`) is embedded directly in the `ExtState` block. Its `nmRefCon` field holds a pointer back to the `ExtState` so the callback can reach the driver ref num and log file without A5:
-
-```
-state->nmRec.nmResp   = ReinitViaNotification;  // our task-level callback
+```c
+state->nmRec.nmResp   = ReinitViaNotification;  // task-level callback
 state->nmRec.nmRefCon = (long)state;            // passed back to us on each call
 state->nmRec.nmMark   = 0;                      // no Apple-menu mark
 state->nmRec.nmIcon   = NULL;                   // no icon
@@ -151,45 +164,45 @@ state->nmRec.nmSound  = NULL;                   // no sound
 state->nmRec.nmStr    = NULL;                   // no alert dialog
 ```
 
-With all the alert fields set to NULL, the notification is completely silent — the user sees nothing. Its only effect is to schedule `ReinitViaNotification` to run at task level.
+With all the alert fields set to NULL, the notification is completely silent — the user sees nothing. Its only effect is to schedule `ReinitViaNotification` to run at task level, where the SCSI Manager calls are safe.
 
-`ReinitViaNotification` is a normal C function (with the `pascal` calling convention attribute, matching what the Notification Manager expects on 68k). It receives the `NMRecPtr`, recovers the `ExtState` pointer from `nmRefCon`, calls `KillIO` and `PBControlSync` to reset the driver, and then calls `NMRemove` to dequeue and clean up the record so it is ready to be installed again on the next wake.
+### Direct SCSI Manager calls (bypassing the .ENET driver)
 
-### The driver system and the Unit Table
+The SCSI command sequence is `SCSIGet` → `SCSISelect(id)` → `SCSICmd(cdb, 6)` → `SCSIComplete(&stat, &msg, timeout)`. The 6-byte CDB is `0E 00 00 00 00 80`. BlueSCSI's firmware (in [`lib/SCSI2SD/src/firmware/network.c`](https://github.com/BlueSCSI/BlueSCSI-v2/blob/main/lib/SCSI2SD/src/firmware/network.c)) checks `cdb[5] & 0x80`: bit set ⇒ `scsiNetworkEnabled = true` and inbound queue cleared; bit clear ⇒ `scsiNetworkEnabled = false`. (The original Dayna SCSI/Link spec places the bit in byte 4 — that's wrong for BlueSCSI, and was a real bug during development.)
 
-The DaynaPORT driver is part of Mac OS's **device driver** architecture. Drivers in classic Mac OS are identified by name (like `.ENET`, `.ENET1`, etc.) and given a **reference number** — a small negative integer — when they are opened. You use the reference number in all subsequent calls to the driver.
+`SCSIGet` serialises against any in-flight `.ENET` driver I/O, so no explicit `KillIO` of the driver is needed before our command. The interleaving is invisible to the driver — from its perspective, one of its own commands just took slightly longer to issue.
 
-To find the driver by name, the code walks the **Unit Table**: a low-memory array of pointers to **Driver Control Entries** (DCE), one per installed driver. Low-memory globals are fixed addresses that the OS uses for global state — addresses baked into the architecture, not in any heap. `0x011C` holds a pointer to the Unit Table array; `0x01D2` holds its count.
+### SCSI ID auto-discovery
 
-Each DCE contains the driver's flags and a pointer (or handle) to the **driver header**, which begins with the driver's name as a Pascal string. Walking the table and comparing names finds the right entry. The reference number is derived as `~index` (bitwise NOT of the array index).
+On the first wake, the INIT walks IDs 0–6 with `INQUIRY` (`0x12`), reads 36 bytes from each that responds, and matches `"DAYNA"` or `"SCSI/LINK"` in the vendor or product field. The first match is cached in `state->scsiID` and used for all subsequent wakes.
 
-`KillIO(refNum)` cancels any I/O operations the driver may have queued before sleep. `PBControlSync` with `csCode = 0` sends a control call to the driver — the equivalent of sending an ioctl in Unix. Code zero is a tentative "soft reset" code; the exact code to use would need to be verified by disassembling the DaynaPORT driver, which is one of the open questions in the project.
-
-### The lifecycle, end to end
-
-1.  **Boot** — the System runs `_start()`. The INIT allocates an `ExtState` block in the System heap, fills in the Sleep Queue record and the `NMRec`, calls `SleepQInstall`, and returns. `Retro68FreeGlobals()` releases the INIT's own temporary C globals, but the `ExtState` block remains. (The code-resource side of "remains permanently" is more involved than it sounds — see the next section.)
-
-2.  **Normal use** — nothing happens. There is no overhead on every event loop iteration, because the Sleep Queue callback only runs on sleep/wake events.
-
-3.  **Wake** — the OS walks the Sleep Queue and fires `sleepWakeUp` at interrupt level. The callback sets `nmPending = 1` and calls `NMInstall(&state->nmRec)`. This links the record into the OS notification queue and returns in microseconds.
-
-4.  **First task-level code after wake** — the Notification Manager fires `ReinitViaNotification`. It clears `nmPending`, calls `KillIO` and `PBControlSync` to flush and reset the driver, logs the result, and calls `NMRemove` to dequeue the record. Network is alive again. The user does not have to do anything.
+The match heuristic deliberately does **not** match on `"BLUESCSI"`: BlueSCSI HDD emulations on the same bus legitimately put that string in their product field, and matching on it would catch the wrong target. Real BlueSCSI DaynaPORT hardware reports `vendor="Dayna"` `product="SCSI/Link"` with SCSI peripheral type `0x03` (processor device) — *not* `0x09` (communications) as the old Dayna spec implies.
 
 ### Note on Retro68 INIT lifetime
 
 The lifecycle above assumes the code resource — the `'INIT'` 128 binary that holds `SleepQGlue` and `ReinitViaNotification` — stays loaded in memory after `_start()` returns. On System 7.5.5, with Retro68's `--mac-flat` INIT layout, **it does not.** Even with `Get1Resource` + `DetachResource` + `HLock` + `HNoPurge`, the block is reclaimed during boot and the memory is reused (in our testing, by a `'sfnt'` font resource). The first time the OS dispatches `sleepWakeUp` it then jumps to garbage and crashes with an Illegal Instruction, often at a "DC.W ????" address inside whatever heap block now occupies that range. Retro68's [`libretro/relocate.c`](https://github.com/autc04/Retro68) carries a comment from the author warning that "all Retro68-compiled code resources have to be locked, or they might get moved as soon as the global variables are allocated below" — the standard 1995 INIT idiom isn't enough on top of Retro68's relocation layout.
 
-The workaround used here (validated through diagnostic steps in `init_minimal.c`):
+The workaround (validated through diagnostic steps in `init_minimal.c`):
 
-1.  In `_start()`, allocate a fresh System-heap block sized to text + data (`&_edata - &_stext`).
-2.  `BlockMoveData` the relocated text + data out of the resource into the new block.
-3.  Walk the absolute relocation records that follow `_edata` in the resource and add `delta = newCode - origBase` to each kind-0/code and kind-1/data longword in the copy. Skip kind-2 (BSS — shared) and kind-3 (jump table — not used). Skip the relative pass entirely; PC-relative offsets within a verbatim copy are preserved.
-4.  Install copied addresses for any callback the OS will dispatch into later: `sleepQProc = &SleepQGlue + delta`, `nmRec.nmResp = &ReinitViaNotification + delta`.
+1. In `_start()`, allocate a fresh System-heap block sized to text + data (`&_edata - &_stext`).
+2. `BlockMoveData` the relocated text + data out of the resource into the new block.
+3. Walk the absolute relocation records that follow `_edata` in the resource and add `delta = newCode - origBase` to each kind-0/code and kind-1/data longword in the copy. Skip kind-2 (BSS — shared) and kind-3 (jump table — not used). Skip the relative pass entirely; PC-relative offsets within a verbatim copy are preserved.
+4. Install copied addresses for any callback the OS will dispatch into later: `sleepQProc = &SleepQGlue + delta`, `nmRec.nmResp = &ReinitViaNotification + delta`.
 
-The System-heap block survives boot independently of the resource map, so the OS dispatches into our copied code instead of into reclaimed memory. `init_minimal.c` step 8 validated the relocation mechanism with a no-op callback; step 9 validates the full Sleep Queue → Notification Manager dance with no driver work. Step 10 will port the driver-reinit logic into `init.c` using the same machinery.
+The System-heap block survives boot independently of the resource map, so the OS dispatches into our copied code instead of into reclaimed memory.
 
-### Open Transport vs. driver-level reinit
+### The lifecycle, end to end
 
-The standalone reinit app in `main.c` finds the `.ENET0` driver, calls `KillIO`, then `PBControlSync` with `csCode = 0` and `csCode = 1`. All three calls return cleanly (`KillIO=0`, `ctrl0=-17` controlErr — `csCode=0` not supported by this driver, expected — `ctrl1=0` noErr). Network does **not** recover. Toggling the TCP/IP control panel (switching to AppleTalk, saving, switching back to Alternate Ethernet, saving) also does not recover. iCab and SevenTTY both hang ~90s and return `-23009` / `-3259`.
+1. **Boot** — the System runs `_start()`. The INIT copies its text+data into a System-heap block, walks Retro68's relocations to fix internal references in the copy, allocates an `ExtState` block in the System heap, fills in the Sleep Queue record and the `NMRec` (with the copied callback addresses), calls `SleepQInstall`, and returns.
 
-This suggests the failure mode is at the Open Transport / DLPI layer rather than the .ENET driver itself: even when the driver responds to control calls, OT's STREAMS state still reflects the pre-sleep configuration and OT does not re-issue DLPI initialization primitives without an explicit interface-down event. Figuring out the right OT-level reinit mechanism is an open question.
+2. **Normal use** — nothing happens. There is no overhead on every event loop iteration; the Sleep Queue callback only runs on sleep/wake events.
+
+3. **Wake** — the OS walks the Sleep Queue and fires `sleepWakeUp` at interrupt level. The callback sets `nmPending = 1` and calls `NMInstall(&state->nmRec)`. Returns in microseconds.
+
+4. **First task-level code after wake** — the Notification Manager fires `ReinitViaNotification`. On first wake it walks the SCSI bus and discovers the BlueSCSI ID. Then it issues the SCSI `0x0E` enable, logs only if something failed, and calls `NMRemove`. Network is alive again. The user does not have to do anything.
+
+## Open questions / future work
+
+- The INIT only re-enables the BlueSCSI's network state; it does not actively wake user-space TCP/IP services that already had providers open before sleep. Open Transport itself reloads cleanly when an app makes a fresh call after wake (per Apple TN1145), so apps following the standard "lazy reopen on `kOTProviderIsClosed`" pattern recover without intervention. Apps that don't may need to be relaunched.
+- The SCSI Manager calls use the old (1986-era synchronous) API rather than SCSI Manager 4.3, for maximum compatibility across 68k Macs. Switching to 4.3 (`SCSIExecIO`) would allow async operation but isn't necessary for this short single-CDB command.
+- The discovery heuristic could be tightened with a SCSI peripheral type check (`pdt == 0x03` AND vendor/product match) if the current heuristic ever produces a false positive on someone's bus.

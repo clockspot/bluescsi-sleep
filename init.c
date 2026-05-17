@@ -1,76 +1,63 @@
 /*
  * BlueSCSI DaynaPORT sleep/wake handler — System Extension (INIT)
  *
- * Loads at boot like any INIT in the Extensions folder.  No user
- * interaction needed: the driver is reinitialised automatically every
- * time the PowerBook wakes from sleep.
+ * On wake from sleep, sends Dayna SCSI/Link command 0x0E (enable
+ * variant) directly to the BlueSCSI's SCSI ID.  This clears the
+ * inbound packet queue in BlueSCSI's firmware and re-asserts its
+ * enabled flag, restoring network connectivity that would otherwise
+ * hang at OTOpenInternetServices with kEHOSTUNREACHErr (-3259) for
+ * ~90 seconds before timing out.
  *
- * Design
- * ──────
- * Two OS hooks are installed in _start():
- *
- *   Sleep Queue  – catches sleepWakeUp at interrupt level.  Calls
- *                  NMInstall to post a silent Notification Manager
- *                  request (NMInstall is documented interrupt-safe).
- *
- *   nmResp       – the Notification Manager invokes this callback at
- *                  task level (safe for all Toolbox calls).  Performs
- *                  KillIO + PBControlSync, then calls NMRemove.
+ * Architecture
+ * ────────────
+ *   • _start() installs a Sleep Queue entry whose callback (interrupt
+ *     level) posts a Notification Manager request on sleepWakeUp.
+ *   • The NM callback (task level) issues SCSI 0x0E enable via the
+ *     synchronous SCSI Manager directly, bypassing the .ENET driver
+ *     and OT entirely.
+ *   • SCSI ID is auto-discovered on first wake by walking IDs 0–6
+ *     with INQUIRY (0x12), matching "Dayna" or "SCSI/Link" in the
+ *     vendor or product field.  Cached for subsequent wakes.
  *
  * Code lifetime: copy-and-relocate
  * ────────────────────────────────
- * On System 7.5.5 with Retro68's --mac-flat INIT layout, the 'INIT'
- * code resource does NOT survive past _start() returning — even with
- * Get1Resource + DetachResource + HLock + HNoPurge, the block is
- * reclaimed during boot and the memory is reused (in our testing, by a
- * 'sfnt' font resource).  The OS then dispatches sleep/wake callbacks
- * into garbage and crashes.
- *
- * To work around this, _start() copies the text+data of the resource
- * into a System-heap allocation and walks the absolute relocation
- * records to fix kind-0/code and kind-1/data references inside the
- * copy.  The Sleep Queue and Notification Manager hooks are then
- * installed with the COPIED addresses — so the OS dispatches into the
- * System-heap block, which is independent of the resource map and
- * lives for the duration of the session.
- *
- * Internal calls inside the relocated copy work because:
- *   • Absolute long JSRs (kind-0) point into the copy after fixup.
- *   • PC-relative branches survive a verbatim copy unchanged (both
- *     source and target moved by the same delta).
- *   • OS trap calls (A-traps) dispatch through the trap table and
- *     don't depend on our code's location.
+ * Under Retro68's --mac-flat INIT layout, the 'INIT' code resource
+ * does not survive _start() returning even with DetachResource +
+ * HLock + HNoPurge — the OS reuses the memory after boot, leaving
+ * Sleep Queue callbacks pointing at garbage.  _start() therefore
+ * copies text+data to a System-heap allocation, walks Retro68's
+ * absolute relocation records to fix kind-0/code and kind-1/data
+ * references inside the copy, and installs the callbacks with the
+ * copied addresses.
  *
  * A5-free design
  * ──────────────
- * After _start() returns, Retro68's A5 world is freed.  All callbacks
- * therefore access state exclusively through:
+ * After _start() returns, Retro68's A5 world is freed.  All
+ * callbacks therefore access state exclusively through:
  *   • An ExtState block in the System heap (NewPtrSysClear).
- *   • SleepQRec is the first field of ExtState, so the sleep callback
- *     receives qRecPtr == &state — no A5 needed.
- *   • nmRec.nmRefCon holds the ExtState pointer for the nmResp callback.
+ *   • SleepQRec is the first field, so the sleep callback receives
+ *     qRecPtr == &state — no A5 needed.
+ *   • nmRec.nmRefCon holds the ExtState pointer for the nmResp
+ *     callback.
  *
  * Logging
  * ───────
- * A plain-text log file named "BlueSCSI Sleep Log" is written to the
- * System Folder.  It is appended on every boot and every wake, so
- * multiple sleep/wake cycles accumulate in one file.  Open it in
- * TeachText or SimpleText to inspect it.
+ * "BlueSCSI Sleep Log" in the System Folder is appended on first
+ * wake (one-time bus walk + selected ID) and on error (SCSI failure
+ * or BlueSCSI not detected).  Silent on successful subsequent wakes,
+ * so the log doesn't grow over hundreds of sleep/wake cycles.
  *
- * All log I/O uses File Manager traps directly (FSpOpenDF, FSWrite, etc.)
- * rather than stdio, because stdio depends on A5-relative globals that are
- * not available after _start() returns.
+ * All log I/O uses File Manager traps directly (FSpOpenDF, FSWrite,
+ * etc.) rather than stdio, because stdio depends on A5-relative
+ * globals that are not available after _start() returns.
  */
 
 #include <MacTypes.h>
 #include <Power.h>
-#include <Devices.h>
 #include <Files.h>
 #include <Folders.h>
 #include <Memory.h>
 #include <Notification.h>
-#include <OSUtils.h>
-#include <Resources.h>
 #include <SCSI.h>
 #include <string.h>
 #include "Retro68Runtime.h"
@@ -79,11 +66,6 @@
  * Relocation records sit immediately after _edata in the resource. */
 extern unsigned char _stext, _edata;
 
-/* ── low-memory Unit Table ───────────────────────────────────────────────── */
-
-#define LMUTableBase()      (*(DCtlHandle **)0x011C)
-#define LMUnitNtryCnt()     (*(short *)0x01D2)
-
 /* ── state allocated in System heap ─────────────────────────────────────── */
 
 /*
@@ -91,39 +73,19 @@ extern unsigned char _stext, _edata;
  * The Sleep Queue callback receives qRecPtr (== &sleepRec).
  * Because sleepRec is first, qRecPtr == (ExtState *)state, giving the
  * callback access to all fields without any A5 reference.
- *
- * Layout:
- *   offset  0: sleepRec      (SleepQRec, 12 bytes)
- *   offset 12: driverRefNum  (short,      2 bytes)
- *   offset 14: nmPending     (byte,       1 byte ) 1 = NMRec in queue
- *   offset 15: _pad          (byte,       1 byte )
- *   offset 16: wakeCount     (short,      2 bytes)
- *   offset 18: logSpecValid  (Boolean,    1 byte )
- *   offset 19: _pad2         (byte,       1 byte )
- *   offset 20: logSpec       (FSSpec,    70 bytes)
- *   offset 90: nmRec         (NMRec,     ~36 bytes)
  */
 typedef struct ExtState {
     SleepQRec       sleepRec;
-    short           driverRefNum;
     unsigned char   nmPending;      /* 1 = NMRec is already in the NM queue */
-    unsigned char   _pad;
-    short           wakeCount;
     Boolean         logSpecValid;
-    unsigned char   _pad2;
+    short           wakeCount;
+    short           scsiID;         /* BlueSCSI SCSI ID; -1 = not yet discovered */
+    short           _pad;
     FSSpec          logSpec;
     NMRec           nmRec;
-    short           scsiID;         /* BlueSCSI SCSI ID; -1 = not yet discovered */
-    short           _pad3;
 } ExtState;
 
-/* ── A5-free logging helpers ─────────────────────────────────────────────── */
-
-/*
- * All log functions use File Manager traps only (no stdio, no A5).
- * LogOpen returns a file reference number, or 0 on failure.
- * Always call LogClose if LogOpen returned non-zero.
- */
+/* ── A5-free logging helpers (used for discovery + errors only) ──────────── */
 
 static short LogOpen(ExtState *state)
 {
@@ -131,10 +93,6 @@ static short LogOpen(ExtState *state)
     long  eof;
     OSErr err;
 
-    /* Lazy init: locate the System Folder on first call (task level only).
-     * We defer this from _start() so that boot-time file I/O does not
-     * trigger System heap compaction, which would move other extensions'
-     * trap handlers and leave the trap table with stale addresses. */
     if (!state->logSpecValid) {
         short vRef;
         long  dirID;
@@ -151,26 +109,22 @@ static short LogOpen(ExtState *state)
         state->logSpecValid = true;
     }
 
-    /* Create the file if it does not yet exist; ignore error if it does. */
     FSpCreate(&state->logSpec, 'ttxt', 'TEXT', 0 /* smSystemScript */);
 
     err = FSpOpenDF(&state->logSpec, fsRdWrPerm, &ref);
     if (err != noErr) return 0;
 
-    /* Seek to end so each write appends. */
     GetEOF(ref, &eof);
     SetFPos(ref, fsFromStart, eof);
-
     return ref;
 }
 
 static void LogClose(short ref, short vRefNum)
 {
     FSClose(ref);
-    FlushVol(NULL, vRefNum);   /* commit to disk — important if Mac crashes on wake */
+    FlushVol(NULL, vRefNum);
 }
 
-/* Write a C string (no A5: length computed with a simple loop, not strlen). */
 static void LogStr(short ref, const char *s)
 {
     long        n = 0;
@@ -179,28 +133,6 @@ static void LogStr(short ref, const char *s)
     if (n > 0) FSWrite(ref, &n, (Ptr)s);
 }
 
-/* Write a single byte as two uppercase hex chars. */
-static void LogHex8(short ref, unsigned char v)
-{
-    static const char hex[] = "0123456789ABCDEF";
-    char  buf[2];
-    long  n = 2;
-    buf[0] = hex[(v >> 4) & 0xF];
-    buf[1] = hex[v & 0xF];
-    FSWrite(ref, &n, buf);
-}
-
-/* Write a sequence of bytes as colon-separated hex (e.g. "00:80:48:11:22:33"). */
-static void LogHexBytes(short ref, const unsigned char *p, short len)
-{
-    short i;
-    for (i = 0; i < len; i++) {
-        if (i > 0) { long n = 1; FSWrite(ref, &n, (Ptr)":"); }
-        LogHex8(ref, p[i]);
-    }
-}
-
-/* Write a signed 16-bit decimal integer. */
 static void LogShort(short ref, short val)
 {
     char           buf[7];   /* worst case: "-32768" = 6 chars */
@@ -209,161 +141,30 @@ static void LogShort(short ref, short val)
     unsigned short u;
     long           n;
 
-    /* Avoid overflow on SHRT_MIN by working in unsigned. */
     u = neg ? (unsigned short)(0u - (unsigned short)val) : (unsigned short)val;
-
-    if (u == 0) {
-        buf[--i] = '0';
-    } else {
-        while (u) {
-            buf[--i] = (char)('0' + u % 10);
-            u /= 10;
-        }
-    }
+    if (u == 0) buf[--i] = '0';
+    else        while (u) { buf[--i] = (char)('0' + u % 10); u /= 10; }
     if (neg) buf[--i] = '-';
 
     n = 7 - i;
     FSWrite(ref, &n, buf + i);
 }
 
-/* ── A5-free driver helpers ──────────────────────────────────────────────── */
-
-static Boolean PStrEqualLocal(const unsigned char *a, const unsigned char *b)
-{
-    unsigned char len = a[0];
-    unsigned char i;
-    if (b[0] != len) return false;
-    for (i = 1; i <= len; i++) {
-        unsigned char ca = a[i], cb = b[i];
-        if (ca >= 'a' && ca <= 'z') ca -= 32;
-        if (cb >= 'a' && cb <= 'z') cb -= 32;
-        if (ca != cb) return false;
-    }
-    return true;
-}
-
-static OSErr FindDriverLocal(const unsigned char *name, short *outRef)
-{
-    DCtlHandle *tbl = LMUTableBase();
-    short       cnt = LMUnitNtryCnt();
-    short       i;
-
-    for (i = 0; i < cnt; i++) {
-        DCtlHandle    h = tbl[i];
-        DCtlPtr       dce;
-        DRVRHeaderPtr hdr;
-
-        if (h == NULL) continue;
-        dce = *h;
-        if (dce == NULL) continue;
-        if (!(dce->dCtlFlags & 0x0020 /* dOpened */)) continue;
-
-        if (dce->dCtlFlags & 0x0040 /* dRAMBased */) {
-            Handle drvrH = (Handle)dce->dCtlDriver;
-            if (drvrH == NULL || *drvrH == NULL) continue;
-            hdr = (DRVRHeaderPtr)*drvrH;
-        } else {
-            hdr = (DRVRHeaderPtr)dce->dCtlDriver;
-        }
-
-        if (hdr == NULL) continue;
-        if (PStrEqualLocal((const unsigned char *)&hdr->drvrName[0], name)) {
-            *outRef = ~i;
-            return noErr;
-        }
-    }
-    return fnfErr;
-}
-
-/*
- * Try each candidate driver name in order.
- * If one is found, logs the match and returns its ref num in state->driverRefNum.
- * Caller passes the already-open log file ref (0 = no log).
- */
-static void FindAndLogDriver(ExtState *state, short logRef)
-{
-    unsigned char n0[6] = {5, '.', 'E', 'N', 'E', 'T'};
-    unsigned char n1[7] = {6, '.', 'E', 'N', 'E', 'T', '0'};
-    unsigned char n2[7] = {6, '.', 'E', 'N', 'E', 'T', '1'};
-    unsigned char n3[7] = {6, '.', 'E', 'N', 'E', 'T', '2'};
-    unsigned char n4[7] = {6, '.', 'E', 'N', 'E', 'T', '3'};
-    short ref = 0;
-
-    if (FindDriverLocal(n0, &ref) == noErr) {
-        if (logRef) { LogStr(logRef, "Driver .ENET ref ");   LogShort(logRef, ref); LogStr(logRef, "\r"); }
-    } else if (FindDriverLocal(n1, &ref) == noErr) {
-        if (logRef) { LogStr(logRef, "Driver .ENET0 ref ");  LogShort(logRef, ref); LogStr(logRef, "\r"); }
-    } else if (FindDriverLocal(n2, &ref) == noErr) {
-        if (logRef) { LogStr(logRef, "Driver .ENET1 ref ");  LogShort(logRef, ref); LogStr(logRef, "\r"); }
-    } else if (FindDriverLocal(n3, &ref) == noErr) {
-        if (logRef) { LogStr(logRef, "Driver .ENET2 ref ");  LogShort(logRef, ref); LogStr(logRef, "\r"); }
-    } else if (FindDriverLocal(n4, &ref) == noErr) {
-        if (logRef) { LogStr(logRef, "Driver .ENET3 ref ");  LogShort(logRef, ref); LogStr(logRef, "\r"); }
-    } else {
-        ref = 0;
-        if (logRef) LogStr(logRef, "Driver not found\r");
-    }
-
-    state->driverRefNum = ref;
-}
-
-/* ── driver status probe ─────────────────────────────────────────────────── */
-
-/*
- * Issue PBStatusSync with csCode = 1.  On Apple-protocol .ENET drivers
- * this is "get hardware address" and returns the 6-byte MAC in csParam.
- * For other drivers it may return something else — we log the raw bytes
- * either way so the response is interpretable from the log.
- *
- * outBytes must point to a 16-byte buffer.  Returns the OSErr from
- * PBStatusSync (noErr on success).
- */
-static OSErr ProbeDriverStatus(short ref, unsigned char outBytes[16])
-{
-    CntrlParam cpb;
-    OSErr      err;
-
-    memset(&cpb, 0, sizeof(cpb));
-    cpb.ioCRefNum = ref;
-    cpb.csCode    = 1;
-    err = PBStatusSync((ParmBlkPtr)&cpb);
-    memcpy(outBytes, (const void *)&cpb.csParam[0], 16);
-    return err;
-}
-
-/*
- * Helper: probe driver, log a labelled line of err + raw bytes.
- * Safe to call only with a valid log ref and non-zero driver ref.
- */
-static void LogDriverProbe(short logRef, short ref, const char *label)
-{
-    unsigned char buf[16];
-    OSErr         err = ProbeDriverStatus(ref, buf);
-
-    LogStr(logRef, label);
-    LogStr(logRef, " err=");
-    LogShort(logRef, err);
-    LogStr(logRef, " bytes=");
-    LogHexBytes(logRef, buf, 16);
-    LogStr(logRef, "\r");
-}
-
 /* ── SCSI Manager helpers (old/sync API; inline _SCSIDispatch traps) ────── */
 
 /*
  * Issue a SCSI command with no data transfer.  Returns the SCSI Manager
- * error from the worst-failing call in the GET/SELECT/CMD/COMPLETE sequence;
- * also writes the device-side status byte into *outStat (0 = GOOD).
+ * error from the worst-failing call in the GET/SELECT/CMD/COMPLETE
+ * sequence; *outStat receives the device-side status byte (0 = GOOD).
  *
- * Safe to call only at task level.  Caller is responsible for ensuring no
- * other I/O is in flight to this target (e.g. KillIO on the .ENET driver
- * first if it owns this SCSI ID).
+ * Task level only.  SCSIGet serialises with any in-flight .ENET driver
+ * I/O, so no explicit KillIO is needed.
  */
 static OSErr ScsiCmdNoData(short id, const unsigned char *cdb, short cdbLen,
                            short *outStat)
 {
-    OSErr   err, getErr;
-    short   stat = 0, msg = 0;
+    OSErr err, getErr;
+    short stat = 0, msg = 0;
 
     *outStat = 0;
 
@@ -371,16 +172,11 @@ static OSErr ScsiCmdNoData(short id, const unsigned char *cdb, short cdbLen,
     if (getErr != noErr) return getErr;
 
     err = SCSISelect(id);
-    if (err != noErr) goto done;
+    if (err == noErr) err = SCSICmd((Ptr)cdb, cdbLen);
 
-    err = SCSICmd((Ptr)cdb, cdbLen);
-    if (err != noErr) goto done;
-
-done:
-    /* SCSIComplete must be called even on error to release the bus.
-     * 60 ticks = ~1 s — generous for a no-data control command. */
+    /* SCSIComplete must be called to release the bus, even after error. */
     {
-        OSErr compErr = SCSIComplete(&stat, &msg, 60);
+        OSErr compErr = SCSIComplete(&stat, &msg, 60 /* ticks ≈ 1 s */);
         *outStat = stat;
         if (err == noErr) err = compErr;
     }
@@ -393,20 +189,15 @@ done:
  */
 static OSErr ScsiInquiry(short id, unsigned char outBuf[36], short *outStat)
 {
-    OSErr             err, getErr;
-    short             stat = 0, msg = 0;
-    SCSIInstr         tib[2];
-    unsigned char     cdb[6];
+    OSErr         err, getErr;
+    short         stat = 0, msg = 0;
+    SCSIInstr     tib[2];
+    unsigned char cdb[6];
 
     *outStat = 0;
     memset(outBuf, 0, 36);
 
-    cdb[0] = 0x12;          /* INQUIRY */
-    cdb[1] = 0;
-    cdb[2] = 0;
-    cdb[3] = 0;
-    cdb[4] = 36;            /* allocation length */
-    cdb[5] = 0;
+    cdb[0] = 0x12; cdb[1] = 0; cdb[2] = 0; cdb[3] = 0; cdb[4] = 36; cdb[5] = 0;
 
     tib[0].scOpcode = scInc;
     tib[0].scParam1 = (long)outBuf;
@@ -419,15 +210,9 @@ static OSErr ScsiInquiry(short id, unsigned char outBuf[36], short *outStat)
     if (getErr != noErr) return getErr;
 
     err = SCSISelect(id);
-    if (err != noErr) goto done;
+    if (err == noErr) err = SCSICmd((Ptr)cdb, 6);
+    if (err == noErr) err = SCSIRead((Ptr)tib);
 
-    err = SCSICmd((Ptr)cdb, 6);
-    if (err != noErr) goto done;
-
-    err = SCSIRead((Ptr)tib);
-    if (err != noErr) goto done;
-
-done:
     {
         OSErr compErr = SCSIComplete(&stat, &msg, 60);
         *outStat = stat;
@@ -438,17 +223,14 @@ done:
 
 /*
  * Issue Dayna SCSI/Link 0x0E "toggle interface".  BlueSCSI's firmware
- * (lib/SCSI2SD/src/firmware/network.c) checks `cdb[5] & 0x80`:
+ * (lib/SCSI2SD/src/firmware/network.c) checks cdb[5] & 0x80:
  *
  *   cdb[5] = 0x80  → scsiNetworkEnabled = true; inbound queue cleared
  *   cdb[5] = 0x00  → scsiNetworkEnabled = false
  *
- * That's the entire effect — no WiFi reset, no buffer reinit beyond the
- * inbound queue.  Plausibly useful after a sleep that left BlueSCSI's
- * enabled flag or inbound queue in an inconsistent state; not useful for
- * anything heavier.
- *
- * Bypasses the .ENET driver and OT entirely.
+ * No WiFi reset, no deeper buffer reinit — just the boolean flag and
+ * the inbound queue, which is sufficient to recover the wedge that
+ * survives across PowerBook sleep.
  */
 static OSErr ScsiToggleInterface(short id, Boolean enable, short *outStat)
 {
@@ -462,10 +244,7 @@ static OSErr ScsiToggleInterface(short id, Boolean enable, short *outStat)
     return ScsiCmdNoData(id, cdb, 6, outStat);
 }
 
-/*
- * Compare an inquiry vendor/product field (space-padded ASCII) against a
- * needle.  Case-insensitive substring match.  needle is a C string.
- */
+/* Case-insensitive substring match against a space-padded ASCII field. */
 static Boolean InqContains(const unsigned char *field, short fieldLen,
                            const char *needle)
 {
@@ -486,48 +265,47 @@ static Boolean InqContains(const unsigned char *field, short fieldLen,
 }
 
 /*
- * Walk SCSI IDs 0–6 and look for the BlueSCSI DaynaPORT emulation.
- * Logs each ID's inquiry response so the user can see exactly what's on
- * the bus.  Returns the first ID whose vendor or product field looks like
- * a DaynaPORT, or -1 if nothing matched.
+ * Walk SCSI IDs 0–6 looking for the BlueSCSI DaynaPORT emulation.
+ * Returns the first matching ID, or -1 if none found.  If logRef is
+ * non-zero, logs every inquiry response (so the user can see what's
+ * on the bus); pass 0 for silent operation.
  *
  * Heuristic: match "DAYNA" or "SCSI/LINK" in vendor or product.
- * (Real BlueSCSI hardware reports vendor="Dayna" product="SCSI/Link"
- * with peripheral type 0x03 "processor device", NOT 0x09 "communications"
- * as the original Dayna spec implies.  HDD emulations on the same bus
- * legitimately put "BlueSCSI" in their product field, so we don't match
- * on the BlueSCSI string — it would catch the wrong target.)
+ * Real BlueSCSI hardware reports vendor="Dayna" product="SCSI/Link"
+ * with peripheral type 0x03 (processor device).  HDD emulations on
+ * the same bus legitimately put "BlueSCSI" in their product field —
+ * we deliberately don't match on that string, lest we toggle the
+ * wrong target.
  */
 static short DiscoverBlueScsiID(short logRef)
 {
-    short          id, found = -1;
-    unsigned char  inq[36];
-    OSErr          err;
-    short          stat;
+    short         id, found = -1;
+    unsigned char inq[36];
+    OSErr         err;
+    short         stat;
 
     for (id = 0; id <= 6; id++) {
         err = ScsiInquiry(id, inq, &stat);
+
         if (logRef) {
-            LogStr(logRef, "  SCSI id=");  LogShort(logRef, id);
-            LogStr(logRef, " err=");       LogShort(logRef, err);
-            LogStr(logRef, " stat=");      LogShort(logRef, stat);
+            LogStr(logRef, "  id="); LogShort(logRef, id);
+            LogStr(logRef, " err="); LogShort(logRef, err);
+            LogStr(logRef, " stat=");LogShort(logRef, stat);
         }
+
         if (err == noErr && stat == 0) {
-            unsigned char  pdt    = inq[0] & 0x1F;
             unsigned char *vendor = &inq[8];
             unsigned char *prod   = &inq[16];
-            Boolean        match;
+            Boolean match = InqContains(vendor, 8,  "DAYNA")   ||
+                            InqContains(prod,   16, "SCSI/LINK")||
+                            InqContains(prod,   16, "DAYNA");
 
             if (logRef) {
                 long n8 = 8, n16 = 16;
-                LogStr(logRef, " pdt=");   LogHex8(logRef, pdt);
-                LogStr(logRef, " v=\"");   FSWrite(logRef, &n8,  (Ptr)vendor);
-                LogStr(logRef, "\" p=\""); FSWrite(logRef, &n16, (Ptr)prod);
+                LogStr(logRef, " v=\""); FSWrite(logRef, &n8,  (Ptr)vendor);
+                LogStr(logRef, "\" p=\"");FSWrite(logRef, &n16, (Ptr)prod);
                 LogStr(logRef, "\"");
             }
-            match = InqContains(vendor, 8,  "DAYNA")    ||
-                    InqContains(prod,   16, "SCSI/LINK")||
-                    InqContains(prod,   16, "DAYNA");
             if (match && found < 0) {
                 found = id;
                 if (logRef) LogStr(logRef, " <- match");
@@ -538,110 +316,59 @@ static short DiscoverBlueScsiID(short logRef)
     return found;
 }
 
-/* ── task-level reinit (Notification Manager nmResp, no A5) ─────────────── */
+/* ── task-level callback (Notification Manager nmResp, no A5) ──────────── */
 
-/*
- * Called by the Notification Manager at task level when needsReinit is set.
- * All state accessed via nmReqPtr->nmRefCon — no A5 required.
- *
- * The Notification Manager passes NMRecPtr on the stack (pascal convention).
- * On 68k this matches the standard C calling convention for a single pointer
- * argument, so no asm glue is needed.
- */
 static pascal void ReinitViaNotification(NMRecPtr nmReqPtr)
 {
-    ExtState  *state = (ExtState *)nmReqPtr->nmRefCon;
-    short      ref   = state->driverRefNum;
-    short      logRef;
-    OSErr      killErr, ctrlErr, ctrl1Err;
-    CntrlParam cpb;
+    ExtState *state = (ExtState *)nmReqPtr->nmRefCon;
+    short     logRef = 0;
+    OSErr     scsiErr;
+    short     scsiStat;
 
-    /* Clear the pending flag before doing any work so that a rapid
-     * sleep/wake cycle during reinit can queue another notification. */
+    /* Clear the pending flag before doing any work so a rapid sleep/wake
+     * cycle during reinit can queue another notification. */
     state->nmPending = 0;
     state->wakeCount++;
-    logRef = LogOpen(state);
 
-    if (logRef) {
-        /* On the very first wake, emit a boot marker so the log shows when
-         * the INIT was active (boot logging was removed to avoid triggering
-         * heap compaction at extension-load time). */
-        if (state->wakeCount == 1)
-            LogStr(logRef, "=== BlueSCSI Sleep INIT active ===\r");
-        LogStr(logRef, "=== Wake ");
-        LogShort(logRef, state->wakeCount);
-        LogStr(logRef, " ===\r");
-    }
-
-    if (ref == 0) {
-        /* Lazy discovery: driver may not have been open at boot time. */
-        if (logRef) LogStr(logRef, "Retrying driver search...\r");
-        FindAndLogDriver(state, logRef);
-        ref = state->driverRefNum;
-    }
-
-    if (ref != 0) {
-        /* Probe the driver before doing anything — captures whether the
-         * driver is responsive in its post-wake state.  Compare against
-         * the pre-sleep probe (logged on sleepDemand). */
-        if (logRef) LogDriverProbe(logRef, ref, "Pre-reset");
-
-        killErr = KillIO(ref);
-
-        memset(&cpb, 0, sizeof(cpb));
-        cpb.ioCRefNum = ref;
-        cpb.csCode    = 0;
-        ctrlErr = PBControlSync((ParmBlkPtr)&cpb);
-
-        /* csCode=0 is confirmed not to restore connectivity; try csCode=1
-         * (Initialize — mirrors what the driver does at open time). */
-        memset(&cpb, 0, sizeof(cpb));
-        cpb.ioCRefNum = ref;
-        cpb.csCode    = 1;
-        ctrl1Err = PBControlSync((ParmBlkPtr)&cpb);
-
-        if (logRef) {
-            LogStr(logRef, "KillIO=");
-            LogShort(logRef, killErr);
-            LogStr(logRef, " ctrl0=");
-            LogShort(logRef, ctrlErr);
-            LogStr(logRef, " ctrl1=");
-            LogShort(logRef, ctrl1Err);
-            LogStr(logRef, "\r");
-
-            /* Probe again to see whether the reset altered the driver's
-             * observable state. */
-            LogDriverProbe(logRef, ref, "Post-reset");
-        }
-    } else {
-        if (logRef) LogStr(logRef, "No driver found, skipping reinit\r");
-    }
-
-    /* SCSI 0x0E enable — bypasses .ENET driver and OT to kick the BlueSCSI
-     * firmware's Ethernet state machine.  Driver-level KillIO above has
-     * already canceled any pending I/O, so the bus should be quiet. */
+    /* First wake: discover the BlueSCSI ID and log the bus walk so the
+     * user can confirm the right target was selected.  Subsequent wakes
+     * skip this entirely. */
     if (state->scsiID < 0) {
-        if (logRef) LogStr(logRef, "Discovering BlueSCSI ID:\r");
+        logRef = LogOpen(state);
+        if (logRef) {
+            LogStr(logRef, "=== BlueSCSI Sleep INIT active ===\r");
+            LogStr(logRef, "Walking SCSI bus:\r");
+        }
         state->scsiID = DiscoverBlueScsiID(logRef);
         if (logRef) {
-            LogStr(logRef, "Selected SCSI ID=");
-            LogShort(logRef, state->scsiID);
-            LogStr(logRef, "\r");
+            if (state->scsiID >= 0) {
+                LogStr(logRef, "Selected SCSI ID=");
+                LogShort(logRef, state->scsiID);
+                LogStr(logRef, "\r");
+            } else {
+                LogStr(logRef, "BlueSCSI DaynaPORT not detected on SCSI bus.\r");
+                LogStr(logRef, "INIT will retry discovery on next wake.\r");
+            }
         }
     }
+
+    /* Wake-time reinit: SCSI 0x0E enable.  Bypasses the .ENET driver
+     * and OT — speaks straight to the BlueSCSI firmware. */
     if (state->scsiID >= 0) {
-        short scsiStat = 0;
-        OSErr scsiErr  = ScsiToggleInterface(state->scsiID, true, &scsiStat);
-        if (logRef) {
-            LogStr(logRef, "SCSI 0x0E enable id=");  LogShort(logRef, state->scsiID);
-            LogStr(logRef, " err=");                 LogShort(logRef, scsiErr);
-            LogStr(logRef, " stat=");                LogShort(logRef, scsiStat);
-            LogStr(logRef, "\r");
+        scsiErr = ScsiToggleInterface(state->scsiID, true, &scsiStat);
+        if (scsiErr != noErr || scsiStat != 0) {
+            if (logRef == 0) logRef = LogOpen(state);
+            if (logRef) {
+                LogStr(logRef, "Wake ");      LogShort(logRef, state->wakeCount);
+                LogStr(logRef, ": SCSI 0x0E enable id="); LogShort(logRef, state->scsiID);
+                LogStr(logRef, " err=");      LogShort(logRef, scsiErr);
+                LogStr(logRef, " stat=");     LogShort(logRef, scsiStat);
+                LogStr(logRef, "\r");
+            }
         }
     }
 
     if (logRef) LogClose(logRef, state->logSpec.vRefNum);
-
     NMRemove(nmReqPtr);
 }
 
@@ -649,56 +376,12 @@ static pascal void ReinitViaNotification(NMRecPtr nmReqPtr)
 
 long SleepQCallbackImpl(long message, SleepQRecPtr qRecPtr)
 {
-    /* SleepQRec is the first field of ExtState, so qRecPtr == &state */
+    /* SleepQRec is the first field of ExtState, so qRecPtr == &state. */
     ExtState *state = (ExtState *)qRecPtr;
-
-    /* sleepDemand fires at task level just before the machine actually
-     * sleeps.  Probe the driver here to capture a known-good baseline,
-     * then disable the BlueSCSI interface so the firmware-level Ethernet
-     * state machine is in a known-clean state on wake. */
-    if (message == sleepDemand) {
-        short logRef = LogOpen(state);
-        short ref    = state->driverRefNum;
-
-        if (ref == 0) FindAndLogDriver(state, logRef);
-        ref = state->driverRefNum;
-
-        if (logRef) {
-            LogStr(logRef, "=== Sleep (about to wake ");
-            LogShort(logRef, (short)(state->wakeCount + 1));
-            LogStr(logRef, ") ===\r");
-            if (ref != 0) LogDriverProbe(logRef, ref, "Pre-sleep");
-            else          LogStr(logRef, "No driver found at sleep time\r");
-        }
-
-        if (state->scsiID < 0) {
-            if (logRef) LogStr(logRef, "Discovering BlueSCSI ID:\r");
-            state->scsiID = DiscoverBlueScsiID(logRef);
-            if (logRef) {
-                LogStr(logRef, "Selected SCSI ID=");
-                LogShort(logRef, state->scsiID);
-                LogStr(logRef, "\r");
-            }
-        }
-        if (state->scsiID >= 0) {
-            short scsiStat = 0;
-            OSErr scsiErr;
-            if (ref != 0) (void)KillIO(ref);   /* quiet the driver first */
-            scsiErr = ScsiToggleInterface(state->scsiID, false, &scsiStat);
-            if (logRef) {
-                LogStr(logRef, "SCSI 0x0E disable id=");  LogShort(logRef, state->scsiID);
-                LogStr(logRef, " err=");                  LogShort(logRef, scsiErr);
-                LogStr(logRef, " stat=");                 LogShort(logRef, scsiStat);
-                LogStr(logRef, "\r");
-            }
-        }
-
-        if (logRef) LogClose(logRef, state->logSpec.vRefNum);
-    }
 
     if (message == sleepWakeUp && !state->nmPending) {
         state->nmPending = 1;
-        NMInstall(&state->nmRec);   /* NMInstall is documented interrupt-safe */
+        NMInstall(&state->nmRec);   /* documented interrupt-safe */
     }
     return 0;
 }
@@ -709,7 +392,7 @@ asm(
     "SleepQGlue:\n"
     "    move.l %a0, -(%sp)\n"        /* push qRecPtr as 2nd arg */
     "    move.l %d0, -(%sp)\n"        /* push message as 1st arg */
-    "    jsr SleepQCallbackImpl\n"    /* result in D0 */
+    "    jsr SleepQCallbackImpl\n"
     "    addq.l #8, %sp\n"
     "    rts\n"
 );
@@ -790,11 +473,10 @@ void _start(void)
 
     state = (ExtState *)NewPtrSysClear(sizeof(ExtState));
     if (state == NULL) goto done;
-    state->scsiID = -1;   /* lazily discovered at first sleep/wake */
+    state->scsiID = -1;   /* lazily discovered on first wake */
 
-    /* Initialise the Notification Manager record.
-     * Silent notification — no mark, no icon, no sound, no alert string.
-     * nmResp is called at task level after each sleepWakeUp. */
+    /* Silent NM record — no mark, no icon, no sound, no alert string.
+     * nmResp runs at task level after each sleepWakeUp. */
     state->nmRec.qType    = nmType;
     state->nmRec.nmMark   = 0;
     state->nmRec.nmIcon   = NULL;
@@ -803,7 +485,7 @@ void _start(void)
     state->nmRec.nmResp   = (NMUPP)copiedNmResp;
     state->nmRec.nmRefCon = (long)state;
 
-    /* Install Sleep Queue entry */
+    /* Install Sleep Queue entry. */
     state->sleepRec.sleepQType = sleepQType;            /* must be 16 */
     state->sleepRec.sleepQProc = (SleepQUPP)copiedGlue;
     SleepQInstall(&state->sleepRec);
